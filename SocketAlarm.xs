@@ -18,19 +18,20 @@
 #define OR_DIE 2
 
 #define CONTROL_TERMINATE 't'
-#define CONTROL_CHANGE_FD 'c'
+#define CONTROL_REWATCH   'r'
 
 static pthread_t        watch_thread;
 static int              control_pipe[2]= { -1, -1 };
-static pthread_mutex_t  alarm_list_mutex= PTHREAD_MUTEX_INITIALIZER;
-static volatile int     alarm_list_count= 0, alarm_list_alloc= 0;
-static volatile struct socketalarm **alarm_list= NULL;
+static pthread_mutex_t  watch_list_mutex= PTHREAD_MUTEX_INITIALIZER;
+static volatile int     watch_list_count= 0, watch_list_alloc= 0;
+static volatile struct socketalarm **watch_list= NULL;
 
 // May only be called by Perl's thread
-static void alarm_list_add(struct socketalarm *alarm);
+static bool watch_list_add(struct socketalarm *alarm);
 // May only be called by Perl's thread
-static void alarm_list_remove(struct socketalarm *alarm);
-
+static bool watch_list_remove(struct socketalarm *alarm);
+static void shutdown_watch_thread();
+static void* watch_thread_main(void*);
 
 #define EVENT_EOF   0x01
 #define EVENT_EPIPE  0x02
@@ -259,8 +260,7 @@ socketalarm_new(int watch_fd, int event_mask, AV *action_spec) {
 
 void socketalarm_free(struct socketalarm *sa) {
    // Must remove the socketalarm from the active list, if present
-   if (sa->list_ofs >= 0)
-      alarm_list_remove(sa);
+   watch_list_remove(sa);
    // was allocated as one chunk
    Safefree(sa);
 }
@@ -281,37 +281,101 @@ static int parse_signal(SV *name_sv) {
    croak("Unimplemented signal name %s", name);
 }
 
-// May only be called by Perl's thread
-static void alarm_list_add(struct socketalarm *alarm) {
-   if (!pthread_mutex_lock(&alarm_list_mutex))
-      croak("mutex_lock failed");
-   if (!alarm_list) {
-      Newxz(alarm_list, 16, volatile struct socketalarm *);
-      alarm_list_alloc= 16;
-   }
-   else if (alarm_list_count >= alarm_list_alloc) {
-      Renew(alarm_list, alarm_list_alloc*2, volatile struct socketalarm *);
-      alarm_list_alloc= alarm_list_alloc*2;
-   }
-   alarm->list_ofs= alarm_list_count;
-   alarm_list[alarm_list_count++]= alarm;
-   pthread_mutex_unlock(&alarm_list_mutex);
+void* watch_thread_main(void* unused) {
+   return NULL;
 }
 
 // May only be called by Perl's thread
-static void alarm_list_remove(struct socketalarm *alarm) {
-   int i= alarm->list_ofs;
-   if (i >= 0) {
-      if (!pthread_mutex_lock(&alarm_list_mutex))
-         croak("mutex_lock failed");
-      // fill the hole in the list by moving the final item
-      if (i < alarm_list_count-1) {
-         alarm_list[i]= alarm_list[alarm_list_count-1];
-         alarm_list[i]->list_ofs= i;
-      }
-      --alarm_list_count;
-      pthread_mutex_unlock(&alarm_list_mutex);
+static bool watch_list_add(struct socketalarm *alarm) {
+   int i;
+   if (pthread_mutex_lock(&watch_list_mutex))
+      croak("mutex_lock failed");
+   if (!watch_list) {
+      Newxz(watch_list, 16, volatile struct socketalarm *);
+      watch_list_alloc= 16;
    }
+   else if (watch_list_count >= watch_list_alloc) {
+      Renew(watch_list, watch_list_alloc*2, volatile struct socketalarm *);
+      watch_list_alloc= watch_list_alloc*2;
+   }
+
+   i= alarm->list_ofs;
+   if (i < 0) {
+      alarm->list_ofs= watch_list_count;
+      watch_list[watch_list_count++]= alarm;
+   }
+   
+   // If the thread is not running, start it.  Also create pipe if needed.
+   if (control_pipe[1] < 0) {
+      if (pipe(control_pipe) != 0) {
+         pthread_mutex_unlock(&watch_list_mutex);
+         croak("pipe() failed");
+      }
+
+      if (pthread_create(&watch_thread, NULL, (void*(*)(void*)) watch_thread_main, NULL) != 0) {
+         pthread_mutex_unlock(&watch_list_mutex);
+         croak("pthread_create failed");
+      }
+   } else {
+      char msg= CONTROL_REWATCH;
+      if (write(control_pipe[1], &msg, 1) != 1) {
+         pthread_mutex_unlock(&watch_list_mutex);
+         croak("failed to notify watch_thread");
+      }
+   }
+   pthread_mutex_unlock(&watch_list_mutex);
+   return i < 0;
+}
+
+// May only be called by Perl's thread
+static bool watch_list_remove(struct socketalarm *alarm) {
+   int i;
+   if (pthread_mutex_lock(&watch_list_mutex))
+      croak("mutex_lock failed");
+   i= alarm->list_ofs;
+   if (i >= 0) {
+      // fill the hole in the list by moving the final item
+      if (i < watch_list_count-1) {
+         watch_list[i]= watch_list[watch_list_count-1];
+         watch_list[i]->list_ofs= i;
+      }
+      --watch_list_count;
+      alarm->list_ofs= -1;
+
+      if (control_pipe[1] >= 0) {
+         char msg= CONTROL_REWATCH;
+         if (write(control_pipe[1], &msg, 1) != 1) {
+            pthread_mutex_unlock(&watch_list_mutex);
+            croak("failed to notify watch_thread");
+         }
+      }
+   }
+   pthread_mutex_unlock(&watch_list_mutex);
+   return i >= 0;
+}
+
+// only called during Perl's END phase.  Just need to let
+// things end gracefully and not have the thread go nuts
+// as sockets get closed.
+static void shutdown_watch_thread() {
+   int i;
+   // Wipe the alarm list
+   if (pthread_mutex_lock(&watch_list_mutex))
+      croak("mutex_lock failed");
+   for (i= 0; i < watch_list_count; i++)
+      watch_list[i]->list_ofs= -1;
+   watch_list_count= 0;
+
+   // Notify the thread to stop
+   if (control_pipe[1] >= 0) {
+      char msg= CONTROL_TERMINATE;
+      if (write(control_pipe[1], &msg, 1) != 1)
+         warn("write(control_pipe) failed");
+   }
+   
+   pthread_mutex_unlock(&watch_list_mutex);
+   // don't bother unallocating watch_list or closing pipe,
+   // because we're exiting anyway.
 }
 
 int fileno_from_sv(SV *sv) {
@@ -444,7 +508,7 @@ int render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
  */
 
 // destructor for Watch objects
-static int iosa_socketalarm_magic_free(pTHX_ SV* sv, MAGIC* mg) {
+static int socketalarm_magic_free(pTHX_ SV* sv, MAGIC* mg) {
    if (mg->mg_ptr) {
       socketalarm_free((struct socketalarm*) mg->mg_ptr);
       mg->mg_ptr= NULL;
@@ -452,23 +516,23 @@ static int iosa_socketalarm_magic_free(pTHX_ SV* sv, MAGIC* mg) {
    return 0; // ignored anyway
 }
 #ifdef USE_ITHREADS
-static int iosa_magic_socketalarm_dup(pTHX_ MAGIC *mg, CLONE_PARAMS *param) {
+static int socketalarm_magic_dup(pTHX_ MAGIC *mg, CLONE_PARAMS *param) {
    croak("This object cannot be shared between threads");
    return 0;
 };
 #else
-#define iosa_socketalarm_magic_dup 0
+#define socketalarm_magic_dup 0
 #endif
 
 // magic table for Watch objects
-static MGVTBL iosa_socketalarm_magic_vt= {
+static MGVTBL socketalarm_magic_vt= {
    0, /* get */
    0, /* write */
    0, /* length */
    0, /* clear */
-   iosa_socketalarm_magic_free,
+   socketalarm_magic_free,
    0, /* copy */
-   iosa_socketalarm_magic_dup
+   socketalarm_magic_dup
 #ifdef MGf_LOCAL
    ,0
 #endif
@@ -476,7 +540,8 @@ static MGVTBL iosa_socketalarm_magic_vt= {
 
 // Return the socketalarm that was attached to a perl Watch object via MAGIC.
 // The 'obj' should be a reference to a blessed magical SV.
-static struct socketalarm* get_magic_socketalarm(SV *obj, int flags) {
+static struct socketalarm*
+get_magic_socketalarm(SV *obj, int flags) {
    SV *sv;
    MAGIC* magic;
 
@@ -488,7 +553,7 @@ static struct socketalarm* get_magic_socketalarm(SV *obj, int flags) {
    sv= SvRV(obj);
    if (SvMAGICAL(sv)) {
       /* Iterate magic attached to this scalar, looking for one with our vtable */
-      if ((magic= mg_findext(sv, PERL_MAGIC_ext, &iosa_socketalarm_magic_vt)))
+      if ((magic= mg_findext(sv, PERL_MAGIC_ext, &socketalarm_magic_vt)))
          /* If found, the mg_ptr points to the fields structure. */
          return (struct socketalarm*) magic->mg_ptr;
    }
@@ -513,7 +578,7 @@ static SV* wrap_socketalarm(struct socketalarm *sa) {
    sa->owner= newHV();
    obj= newRV_noinc((SV*) sa->owner);
    sv_bless(obj, gv_stashpv("IO::SocketAlarm", GV_ADD));
-   magic= sv_magicext((SV*) sa->owner, NULL, PERL_MAGIC_ext, &iosa_socketalarm_magic_vt, (const char*) sa, 0);
+   magic= sv_magicext((SV*) sa->owner, NULL, PERL_MAGIC_ext, &socketalarm_magic_vt, (const char*) sa, 0);
 #ifdef USE_ITHREADS
    magic->mg_flags |= MGf_DUP;
 #else
@@ -548,10 +613,26 @@ _new_socketalarm(sock_sv, eventmask, actions)
    OUTPUT:
       RETVAL
 
+bool
+start(alarm)
+   struct socketalarm *alarm
+   CODE:
+      RETVAL= watch_list_add(alarm);
+   OUTPUT:
+      RETVAL
+
+bool
+cancel(alarm)
+   struct socketalarm *alarm
+   CODE:
+      RETVAL= watch_list_remove(alarm);
+   OUTPUT:
+      RETVAL
+
 void
 _terminate_all()
    PPCODE:
-      (void)0;
+      shutdown_watch_thread();
 
 MODULE = IO::SocketAlarm               PACKAGE = IO::SocketAlarm::Util
 
