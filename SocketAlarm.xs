@@ -66,22 +66,24 @@ int _fileno_from_sv(SV *sv) {
 int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
    struct stat statbuf;
    struct sockaddr_storage addr;
-   socklen_t addr_len;
-   char *bufpos= buf, *buflim= buf + sizeof_buf;
+   size_t len= 0;
    int i, j, n_closed;
 
-   bufpos += snprintf(bufpos, buflim - bufpos, "File descriptors {\n");
-   for (i= 0; i < max_fd && bufpos < buflim; i++) {
-      addr_len= sizeof(addr);
+   len= snprintf(buf, sizeof_buf, "File descriptors {\n");
+   for (i= 0; i < max_fd; i++) {
+      socklen_t addr_len= sizeof(addr);
+      char * bufpos= buf + len;
+      size_t avail= sizeof_buf > len? sizeof_buf - len : 0;
+
       if (fstat(i, &statbuf) < 0) {
          // Find the next valid fd
          for (j= i+1; j < max_fd; j++)
             if (fstat(j, &statbuf) == 0)
                break;
          if (j - i >= 2)
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d-%d: (closed)\n", i, j-1);
+            len += snprintf(bufpos, avail, "%4d-%d: (closed)\n", i, j-1);
          else
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: (closed)\n", i);
+            len += snprintf(bufpos, avail, "%4d: (closed)\n", i);
          i= j;
       }
       else if (!S_ISSOCK(statbuf.st_mode)) {
@@ -93,20 +95,20 @@ int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
          got= readlink(pathbuf, linkbuf, sizeof(linkbuf));
          if (got > 0 && got < sizeof(linkbuf)) {
             linkbuf[got]= '\0';
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: %s\n", i, linkbuf);
+            len += snprintf(bufpos, avail, "%4d: %s\n", i, linkbuf);
          } else {
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: (not a socket, no proc/fd?)\n", i);
+            len += snprintf(bufpos, avail, "%4d: (not a socket, no proc/fd?)\n", i);
          }
       }
       else {
          if (getsockname(i, (struct sockaddr*) &addr, &addr_len) < 0) {
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: (getsockname failed)", i);
+            len += snprintf(bufpos, avail, "%4d: (getsockname failed)", i);
          }
          else if (addr.ss_family == AF_INET) {
             char addr_str[INET6_ADDRSTRLEN];
             struct sockaddr_in *sin= (struct sockaddr_in*) &addr;
             inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: inet [%s]:%d", i, addr_str, ntohs(sin->sin_port));
+            len += snprintf(bufpos, avail, "%4d: inet [%s]:%d", i, addr_str, ntohs(sin->sin_port));
          }
          else if (addr.ss_family == AF_UNIX) {
             struct sockaddr_un *sun= (struct sockaddr_un*) &addr;
@@ -115,19 +117,21 @@ int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
             for (p= sun->sun_path; *p; p++)
                if (*p <= 0x20 || *p >= 0x7F)
                   *p= '?';
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: unix [%s]", i, sun->sun_path);
+            len += snprintf(bufpos, avail, "%4d: unix [%s]", i, sun->sun_path);
          }
          else {
-            bufpos += snprintf(bufpos, buflim - bufpos, "%4d: ? socket family %d", i, addr.ss_family);
+            len += snprintf(bufpos, avail, "%4d: ? socket family %d", i, addr.ss_family);
          }
+         bufpos= buf + len;
+         avail= sizeof_buf > len? sizeof_buf - len : 0;
 
          // Is it connected to anything?
-         if (bufpos < buflim && getpeername(i, (struct sockaddr*) &addr, &addr_len) == 0) {
+         if (getpeername(i, (struct sockaddr*) &addr, &addr_len) == 0) {
             if (addr.ss_family == AF_INET) {
                char addr_str[INET6_ADDRSTRLEN];
                struct sockaddr_in *sin= (struct sockaddr_in*) &addr;
                inet_ntop(AF_INET, &sin->sin_addr, addr_str, sizeof(addr_str));
-               bufpos += snprintf(bufpos, buflim - bufpos, " -> [%s]:%d\n", addr_str, ntohs(sin->sin_port));
+               len += snprintf(bufpos, avail, " -> [%s]:%d\n", addr_str, ntohs(sin->sin_port));
             }
             else if (addr.ss_family == AF_UNIX) {
                struct sockaddr_un *sun= (struct sockaddr_un*) &addr;
@@ -136,27 +140,31 @@ int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
                for (p= sun->sun_path; *p; p++)
                   if (*p <= 0x20 || *p >= 0x7F)
                      *p= '?';
-               bufpos += snprintf(bufpos, buflim - bufpos, " -> unix [%s]\n", sun->sun_path);
+               len += snprintf(bufpos, avail, " -> unix [%s]\n", sun->sun_path);
             }
             else {
-               bufpos += snprintf(bufpos, buflim - bufpos, " -> socket family %d\n", addr.ss_family);
+               len += snprintf(bufpos, avail, " -> socket family %d\n", addr.ss_family);
             }
          }
-         else if (bufpos + 1 < buflim) {
-            *bufpos++ = '\n';
-            *bufpos= '\0';
+         else {
+            len++;
+            if (avail > 0)
+               bufpos[0]= '\n';
          }
       }
    }
-   if (bufpos + 2 < buflim) {
-      bufpos += snprintf(bufpos, buflim - bufpos, "}\n");
-   } else {
-      if (sizeof_buf >= 3) buflim[-3]= '}';
-      if (sizeof_buf >= 2) buflim[-2]= '\n';
-      if (sizeof_buf >= 1) buflim[-1]= '\0';
-      bufpos= buflim;
+   // Did it all fit in the buffer, including NUL terminator?
+   if (len + 3 <= sizeof_buf) {
+      buf[len++]= '}';
+      buf[len++]= '\n';
+      buf[len  ]= '\0';
    }
-   return bufpos - buf;
+   else { // overwrite last 2 chars to end with newline and NUL
+      if (sizeof_buf > 1) buf[sizeof_buf-2]= '\n';
+      if (sizeof_buf > 0) buf[sizeof_buf-1]= '\0';
+      len= sizeof_buf-1;
+   }
+   return len;
 }
 
 void iosa_socketalarm_destroy(struct socketalarm *sw) {
@@ -265,17 +273,6 @@ _terminate_all()
 
 MODULE = IO::SocketAlarm               PACKAGE = IO::SocketAlarm::Util
 
-SV *
-render_fd_table(max_fd=1024)
-   int max_fd
-   INIT:
-      char buffer[4096];
-   CODE:
-      int len= _render_fd_table(buffer, sizeof(buffer), max_fd);
-      RETVAL= newSVpvn(buffer, len);
-   OUTPUT:
-      RETVAL
-
 bool
 is_socket(fd_sv)
    SV *fd_sv
@@ -284,6 +281,25 @@ is_socket(fd_sv)
       struct stat statbuf;
    CODE:
       RETVAL= fd >= 0 && fstat(fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode);
+   OUTPUT:
+      RETVAL
+
+SV *
+render_fd_table(max_fd=1024)
+   int max_fd
+   INIT:
+      SV *out= newSVpvn("",0);
+      size_t avail= 0, needed= 1023;
+   CODE:
+      // FD status could change between calls, changing the length requirement, so loop.
+      // 'avail' count includes the NUL byte, and 'needed' does not.
+      while (avail <= needed) {
+         sv_grow(out, needed+1);
+         avail= needed+1;
+         needed= _render_fd_table(SvPVX(out), avail, max_fd);
+      }
+      SvCUR_set(out, needed);
+      RETVAL= out;
    OUTPUT:
       RETVAL
 
