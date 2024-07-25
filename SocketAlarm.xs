@@ -20,29 +20,301 @@
 #define CONTROL_TERMINATE 't'
 #define CONTROL_CHANGE_FD 'c'
 
+static pthread_t        watch_thread;
+static int              control_pipe[2]= { -1, -1 };
+static pthread_mutex_t  alarm_list_mutex= PTHREAD_MUTEX_INITIALIZER;
+static volatile int     alarm_list_count= 0, alarm_list_alloc= 0;
+static volatile struct socketalarm **alarm_list= NULL;
+
+// May only be called by Perl's thread
+static void alarm_list_add(struct socketalarm *alarm);
+// May only be called by Perl's thread
+static void alarm_list_remove(struct socketalarm *alarm);
+
+
 #define EVENT_EOF   0x01
 #define EVENT_EPIPE  0x02
 
-static pthread_t watch_thread;
+#define ACT_KILL        1
+#define ACT_CLOSE_FD    2
+#define ACT_CLOSE_NAME  3
+#define ACT_EXEC        4
+#define ACT_RUN         5
+#define ACT_SLEEP       6
+#define ACT_REPEAT      7
 
-static int control_pipe[2]= { -1, -1 };
-
-struct socketalarm {
-   HV *owner;
-   int watch_fd;
-   int mysql_sock;
+struct action_kill {
+   pid_t pid;
    int signal;
-   #define MAX_EXEC_ARGC 64
-   int exec_argc;
-   int exec_arg_ofs[MAX_EXEC_ARGC];
-   char exec_buffer[512];
+};
+struct action_close_fd {
+   int how;
+   int fd;
+};
+struct action_close_name {
+   int how;
+   struct sockaddr *addr;
+   socklen_t addr_len;
+};
+struct action_run {
+   int argc;
+   char **argv;   // allocated to length argc+1
+};
+struct action_sleep {
+   double seconds;
+   struct timespec end_ts; // used during execution
+};
+struct action_repeat {
+   int count;
+};
+struct action {
+   int op;
+   union {
+      struct action_kill       kill;
+      struct action_close_fd   clfd;
+      struct action_close_name clname;
+      struct action_run        run;
+      struct action_sleep      slp;
+      struct action_repeat     rep;
+   } act;
 };
 
-pthread_mutex_t action_data_mutex= PTHREAD_MUTEX_INITIALIZER;
-static volatile int watch_count;
-static volatile struct socketalarm **watches;
+struct socketalarm {
+   int list_ofs;     // position within action_list, initially -1 until activated
+   int watch_fd;
+   int event_mask;
+   int action_count;
+   int cur_action;   // used during execution
+   HV *owner;
+   struct action actions[];
+};
 
-int _fileno_from_sv(SV *sv) {
+static int parse_signal(SV *name);
+
+bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *aux_buf, size_t *aux_len) {
+   bool success;
+   size_t action_pos= 0;
+   size_t aux_pos= 0;
+   int i, n_spec= av_len(spec)+1;
+
+   for (i= 0; i < n_spec; i++) {
+      AV *action_spec;
+      const char *act_name= NULL;
+      STRLEN act_namelen= 0;
+      SV **el;
+      size_t n_el;
+
+      // Get the arrayref for the next action
+      el= av_fetch(spec, i, 0);
+      if (!(el && *el && SvROK(*el) && SvTYPE(SvRV(*el)) == SVt_PVAV))
+         croak("Actions must be arrayrefs");
+
+      // Get the 'command' name of the action
+      action_spec= (AV*) SvRV(*el);
+      n_el= av_len(action_spec)+1;
+      if (n_el < 1 || !(el= av_fetch(action_spec, 0, 0)) || !SvPOK(*el))
+         croak("First element of action must be a string");
+      act_name= SvPV(*el, act_namelen);
+
+      // Dispatch based on the command
+      switch (act_namelen) {
+      case 3:
+         if (strcmp(act_name, "sig") == 0) {
+            int signal;
+            if (n_el > 2)
+               croak("Too many parameters for 'sig' action");
+            signal= (n_el == 2 && (el= av_fetch(action_spec, 1, 0)) != NULL && SvOK(*el))?
+               parse_signal(*el) : SIGALRM;
+            // Is there an available action?
+            if (action_pos < *n_actions) {
+               actions[action_pos].op= ACT_KILL;
+               actions[action_pos].act.kill.signal= signal;
+               actions[action_pos].act.kill.pid= getpid();
+            }
+            ++action_pos;
+            break;
+         }
+         if (strcmp(act_name, "run") == 0) {
+            if (action_pos < *n_actions)
+               actions[action_pos].op= ACT_RUN;
+            goto parse_exec_common;
+         }
+      case 4:
+         if (strcmp(act_name, "kill") == 0) {
+            pid_t pid;
+            int signal;
+            if (n_el != 3)
+               croak("Expected 2 parameters for 'kill' action");
+            el= av_fetch(action_spec, 1, 0);
+            if (!el || !SvIOK(*el))
+               croak("Expected PID as first parameter to 'kill'");
+            pid= SvIV(*el);
+            el= av_fetch(action_spec, 2, 0);
+            if (!el || !SvOK(*el))
+               croak("Expected Signal as second parameter to 'kill'");
+            signal= parse_signal(*el);
+            if (action_pos < *n_actions) {
+               actions[action_pos].op= ACT_KILL;
+               actions[action_pos].act.kill.pid= pid;
+               actions[action_pos].act.kill.signal= signal;
+            }
+            ++action_pos;
+            break;
+         }
+         if (strcmp(act_name, "exec") == 0) {
+            if (action_pos < *n_actions)
+               actions[action_pos].op= ACT_EXEC;
+            parse_exec_common: // arriving from 'run', above
+            if (n_el < 2)
+               croak("Expected at least one parameter for '%s'", act_name);
+            // Align to pointer boundary within aux_buf
+            aux_pos += sizeof(void*) - 1;
+            aux_pos &= ~(sizeof(void*) - 1);
+            {
+               // allocate an array of char* within aux_buf
+               char **argv= aux_pos + sizeof(void*) * n_el <= *aux_len? (char**)(aux_buf + aux_pos) : NULL;
+               char *str;
+               STRLEN len;
+               int j, argc= n_el-1;
+               aux_pos += sizeof(void*) * (argc+1);
+               // size up each of the strings, and copy them to the buffer if space available
+               for (j= 0; j < argc; j++) {
+                  el= av_fetch(action_spec, j+1, 0);
+                  if (!el || !*el || !SvOK(*el))
+                     croak("Found undef element in arguments for '%s'", act_name);
+                  str= SvPV(*el, len);
+                  if (argv && aux_pos + len + 1 <= *aux_len) {
+                     argv[j]= aux_buf + aux_pos;
+                     memcpy(argv[j], str, len+1);
+                  }
+                  aux_pos += len+1;
+               }
+               // argv lists must end with NULL
+               if (argv)
+                  argv[argc]= NULL;
+               // store in an action if space remaining.
+               if (action_pos < *n_actions) {
+                  actions[action_pos].act.run.argc= argc;
+                  actions[action_pos].act.run.argv= argv;
+               }
+               ++action_pos;
+            }
+            break;
+         }
+      case 5:
+         if (strcmp(act_name, "sleep") == 0) {
+            if (n_el != 2)
+               croak("Expected 1 parameter to 'sleep' action");
+            el= av_fetch(action_spec, 1, 0);
+            if (!el || !SvOK(*el) || !looks_like_number(*el))
+               croak("Expected number of seconds in 'sleep' action");
+            if (action_pos < *n_actions) {
+               actions[action_pos].op= ACT_SLEEP;
+               actions[action_pos].act.slp.seconds= SvNV(*el);
+            }
+            ++action_pos;
+            break;
+         }
+      case 6:
+         if (strcmp(act_name, "repeat") == 0) {
+            croak("Unimplemented");
+         }
+      case 8:
+         if (strcmp(act_name, "close_fd") == 0) {
+            croak("Unimplemented");
+         }
+      default:
+         croak("Unknown command '%s' in action list", act_name);
+      }
+   }
+   success= (action_pos <= *n_actions) && (aux_pos <= *aux_len);
+   *n_actions= action_pos;
+   *aux_len= aux_pos;
+   return success;
+}
+
+struct socketalarm *
+socketalarm_new(int watch_fd, int event_mask, AV *action_spec) {
+   size_t n_actions= 0, aux_len= 0, len_before_aux;
+   struct socketalarm *self= NULL;
+
+   parse_actions(action_spec, NULL, &n_actions, NULL, &aux_len);
+   // buffer needs aligned to pointer, which sizeof(struct action) is not guaranteed to be
+   len_before_aux= sizeof(struct socketalarm) + n_actions * sizeof(struct action);
+   len_before_aux += sizeof(void*)-1;
+   len_before_aux &= ~(sizeof(void*)-1);
+   self= (struct socketalarm *) safecalloc(1, len_before_aux + aux_len);
+   // second call should succeed, because we gave it back it's own requested buffer sizes.
+   // could fail if user did something evil like a tied scalar that changes length...
+   if (!parse_actions(action_spec, self->actions, &n_actions, ((char*)self) + len_before_aux, &aux_len))
+      croak("BUG: buffers not large enough for parse_actions");
+   self->watch_fd= watch_fd;
+   self->event_mask= event_mask;
+   self->action_count= n_actions;
+   self->cur_action= -1;
+   self->list_ofs= -1;
+   self->owner= NULL;
+   return self;
+}
+
+void socketalarm_free(struct socketalarm *sa) {
+   // Must remove the socketalarm from the active list, if present
+   if (sa->list_ofs >= 0)
+      alarm_list_remove(sa);
+   // was allocated as one chunk
+   Safefree(sa);
+}
+
+static int parse_signal(SV *name_sv) {
+   char *name;
+   if (looks_like_number(name_sv))
+      return SvIV(name_sv);
+   name= SvPV_nolen(name_sv);
+   if (!strcmp(name, "SIGKILL")) return SIGKILL;
+   if (!strcmp(name, "SIGTERM")) return SIGTERM;
+   if (!strcmp(name, "SIGUSR1")) return SIGUSR1;
+   if (!strcmp(name, "SIGUSR2")) return SIGUSR2;
+   if (!strcmp(name, "SIGALRM")) return SIGALRM;
+   if (!strcmp(name, "SIGABRT")) return SIGABRT;
+   if (!strcmp(name, "SIGINT" )) return SIGINT;
+   if (!strcmp(name, "SIGHUP" )) return SIGHUP;
+   croak("Unimplemented signal name %s", name);
+}
+
+// May only be called by Perl's thread
+static void alarm_list_add(struct socketalarm *alarm) {
+   if (!pthread_mutex_lock(&alarm_list_mutex))
+      croak("mutex_lock failed");
+   if (!alarm_list) {
+      Newxz(alarm_list, 16, volatile struct socketalarm *);
+      alarm_list_alloc= 16;
+   }
+   else if (alarm_list_count >= alarm_list_alloc) {
+      Renew(alarm_list, alarm_list_alloc*2, volatile struct socketalarm *);
+      alarm_list_alloc= alarm_list_alloc*2;
+   }
+   alarm->list_ofs= alarm_list_count;
+   alarm_list[alarm_list_count++]= alarm;
+   pthread_mutex_unlock(&alarm_list_mutex);
+}
+
+// May only be called by Perl's thread
+static void alarm_list_remove(struct socketalarm *alarm) {
+   int i= alarm->list_ofs;
+   if (i >= 0) {
+      if (!pthread_mutex_lock(&alarm_list_mutex))
+         croak("mutex_lock failed");
+      // fill the hole in the list by moving the final item
+      if (i < alarm_list_count-1) {
+         alarm_list[i]= alarm_list[alarm_list_count-1];
+         alarm_list[i]->list_ofs= i;
+      }
+      --alarm_list_count;
+      pthread_mutex_unlock(&alarm_list_mutex);
+   }
+}
+
+int fileno_from_sv(SV *sv) {
    PerlIO *io;
    GV *gv;
    SV *rv;
@@ -63,7 +335,7 @@ int _fileno_from_sv(SV *sv) {
    return -1;
 }
 
-int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
+int render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
    struct stat statbuf;
    struct sockaddr_storage addr;
    size_t len= 0;
@@ -167,10 +439,6 @@ int _render_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
    return len;
 }
 
-void iosa_socketalarm_destroy(struct socketalarm *sw) {
-   // TODO
-}
-
 /*------------------------------------------------------------------------------------
  * Definitions of Perl MAGIC that attach C structs to Perl SVs
  */
@@ -178,8 +446,7 @@ void iosa_socketalarm_destroy(struct socketalarm *sw) {
 // destructor for Watch objects
 static int iosa_socketalarm_magic_free(pTHX_ SV* sv, MAGIC* mg) {
    if (mg->mg_ptr) {
-      iosa_socketalarm_destroy((struct socketalarm*) mg->mg_ptr);
-      Safefree(mg->mg_ptr);
+      socketalarm_free((struct socketalarm*) mg->mg_ptr);
       mg->mg_ptr= NULL;
    }
    return 0; // ignored anyway
@@ -209,7 +476,7 @@ static MGVTBL iosa_socketalarm_magic_vt= {
 
 // Return the socketalarm that was attached to a perl Watch object via MAGIC.
 // The 'obj' should be a reference to a blessed magical SV.
-static struct socketalarm* iosa_get_magic_socketalarm(SV *obj, int flags) {
+static struct socketalarm* get_magic_socketalarm(SV *obj, int flags) {
    SV *sv;
    MAGIC* magic;
 
@@ -233,20 +500,20 @@ static struct socketalarm* iosa_get_magic_socketalarm(SV *obj, int flags) {
 // Return existing Watch object, or create a new one.
 // Returned SV has a non-mortal refcount, which is what the typemap
 // wants for returning a "struct socketalarm*" to perl-land
-static SV* iosa_wrap_socketalarm(struct socketalarm *sw) {
+static SV* wrap_socketalarm(struct socketalarm *sa) {
    SV *obj;
    MAGIC *magic;
    // Since this is used in typemap, handle NULL gracefully
-   if (!sw)
+   if (!sa)
       return &PL_sv_undef;
    // If there is already a node object, return a new reference to it.
-   if (sw->owner)
-      return newRV_inc((SV*) sw->owner);
+   if (sa->owner)
+      return newRV_inc((SV*) sa->owner);
    // else create a node object
-   sw->owner= newHV();
-   obj= newRV_noinc((SV*) sw->owner);
-   sv_bless(obj, gv_stashpv("IO::SocketStatusSignaler::Watch", GV_ADD));
-   magic= sv_magicext((SV*) sw->owner, NULL, PERL_MAGIC_ext, &iosa_socketalarm_magic_vt, (const char*) sw, 0);
+   sa->owner= newHV();
+   obj= newRV_noinc((SV*) sa->owner);
+   sv_bless(obj, gv_stashpv("IO::SocketAlarm", GV_ADD));
+   magic= sv_magicext((SV*) sa->owner, NULL, PERL_MAGIC_ext, &iosa_socketalarm_magic_vt, (const char*) sa, 0);
 #ifdef USE_ITHREADS
    magic->mg_flags |= MGf_DUP;
 #else
@@ -266,6 +533,21 @@ static SV * new_enum_dualvar(pTHX_ IV ival, SV *name) {
 
 MODULE = IO::SocketAlarm               PACKAGE = IO::SocketAlarm
 
+struct socketalarm *
+_new_socketalarm(sock_sv, eventmask, actions)
+   SV *sock_sv
+   int eventmask
+   AV *actions
+   INIT:
+      int sock_fd= fileno_from_sv(sock_sv);
+      struct stat statbuf;
+   CODE:
+      if (!(sock_fd >= 0 && fstat(sock_fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode)))
+         croak("Not an open socket");
+      RETVAL= socketalarm_new(sock_fd, eventmask, actions);
+   OUTPUT:
+      RETVAL
+
 void
 _terminate_all()
    PPCODE:
@@ -277,7 +559,7 @@ bool
 is_socket(fd_sv)
    SV *fd_sv
    INIT:
-      int fd= _fileno_from_sv(fd_sv);
+      int fd= fileno_from_sv(fd_sv);
       struct stat statbuf;
    CODE:
       RETVAL= fd >= 0 && fstat(fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode);
@@ -296,7 +578,7 @@ render_fd_table(max_fd=1024)
       while (avail <= needed) {
          sv_grow(out, needed+1);
          avail= needed+1;
-         needed= _render_fd_table(SvPVX(out), avail, max_fd);
+         needed= render_fd_table(SvPVX(out), avail, max_fd);
       }
       SvCUR_set(out, needed);
       RETVAL= out;

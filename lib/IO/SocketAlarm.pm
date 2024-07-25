@@ -162,13 +162,13 @@ Send yourself a signal. The signal constants come from C<< use POSIX ':signal_h'
 
 Send a signal to any process.
 
-=item close
+=item close_fd
 
   [ close => $fd1, $fd2, $fd3... ],
 
 Close one or more file descriptors.  This could have uses like killing database connections.
 
-=item close_all
+=item close_name
 
   [ close_all => $sockname1, $sockname2... ],
 

@@ -1,10 +1,10 @@
 TYPEMAP
-struct socket_watch*    O_SocketWatch
+struct socketalarm*    O_SocketAlarm
 
 INPUT
-O_SocketWatch
-    $var= isss_get_magic_socket_watch($arg, OR_DIE);
+O_SocketAlarm
+    $var= get_magic_socketalarm($arg, OR_DIE);
 
 OUTPUT
-O_SocketWatch
-    $arg= isss_wrap_socket_watch($var);
+O_SocketAlarm
+    $arg= wrap_socketalarm($var);

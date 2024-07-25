@@ -1,3 +1,4 @@
+# PODNAME: IO::SocketAlarm::Util
 # This package is defined in XS loaded by IO::SocketAlarm.
 # This file stub exists for documentation and to allow 'use ...Util'
 require IO::SocketAlarm;
