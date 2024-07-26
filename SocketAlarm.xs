@@ -33,50 +33,55 @@ static bool watch_list_remove(struct socketalarm *alarm);
 static void shutdown_watch_thread();
 static void* watch_thread_main(void*);
 
-#define EVENT_EOF   0x01
+#define EVENT_EOF    0x01
 #define EVENT_EPIPE  0x02
 
-#define ACT_KILL        1
-#define ACT_CLOSE_FD    2
-#define ACT_CLOSE_NAME  3
-#define ACT_EXEC        4
-#define ACT_RUN         5
-#define ACT_SLEEP       6
-#define ACT_REPEAT      7
+#define ACT_KILL          0x10
+#define ACT_SLEEP         0x20
+#define ACT_JUMP          0x30
+#define ACT_EXEC          0x40
+#define ACT_RUN           0x41
+#define ACT_FD_x          0x50
+#define ACT_PNAME_x       0x60
+#define ACT_SNAME_x       0x70
+#define ACT_x_CLOSE       0x00
+#define ACT_x_SHUT_R      0x01
+#define ACT_x_SHUT_W      0x02
+#define ACT_x_SHUT_RW     0x03
+
 
 struct action_kill {
    pid_t pid;
    int signal;
 };
-struct action_close_fd {
-   int how;
+struct action_fd {
    int fd;
 };
-struct action_close_name {
-   int how;
+struct action_sockname {
    struct sockaddr *addr;
    socklen_t addr_len;
 };
 struct action_run {
-   int argc;
    char **argv;   // allocated to length argc+1
+   int argc;
 };
 struct action_sleep {
    double seconds;
    struct timespec end_ts; // used during execution
 };
-struct action_repeat {
-   int count;
+struct action_jump {
+   int idx;
 };
 struct action {
-   int op;
+   int op;       // one of the ACT_* enum codes
+   int orig_idx; // offset in original arrayref of actions
    union {
       struct action_kill       kill;
-      struct action_close_fd   clfd;
-      struct action_close_name clname;
+      struct action_fd         fd;
+      struct action_sockname   nam;
       struct action_run        run;
       struct action_sleep      slp;
-      struct action_repeat     rep;
+      struct action_jump       jmp;
    } act;
 };
 
@@ -91,22 +96,25 @@ struct socketalarm {
 };
 
 static int parse_signal(SV *name);
+static int fileno_from_sv(SV *sv);
 
 bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *aux_buf, size_t *aux_len) {
    bool success;
    size_t action_pos= 0;
    size_t aux_pos= 0;
-   int i, n_spec= av_len(spec)+1;
+   int spec_i, n_spec= av_len(spec)+1;
 
-   for (i= 0; i < n_spec; i++) {
+   for (spec_i= 0; spec_i < n_spec; spec_i++) {
       AV *action_spec;
       const char *act_name= NULL;
       STRLEN act_namelen= 0;
       SV **el;
       size_t n_el;
+      pid_t common_pid;
+      int common_op, common_signal;
 
       // Get the arrayref for the next action
-      el= av_fetch(spec, i, 0);
+      el= av_fetch(spec, spec_i, 0);
       if (!(el && *el && SvROK(*el) && SvTYPE(SvRV(*el)) == SVt_PVAV))
          croak("Actions must be arrayrefs");
 
@@ -121,86 +129,34 @@ bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *au
       switch (act_namelen) {
       case 3:
          if (strcmp(act_name, "sig") == 0) {
-            int signal;
             if (n_el > 2)
                croak("Too many parameters for 'sig' action");
-            signal= (n_el == 2 && (el= av_fetch(action_spec, 1, 0)) != NULL && SvOK(*el))?
+            common_signal= (n_el == 2 && (el= av_fetch(action_spec, 1, 0)) != NULL && SvOK(*el))?
                parse_signal(*el) : SIGALRM;
-            // Is there an available action?
-            if (action_pos < *n_actions) {
-               actions[action_pos].op= ACT_KILL;
-               actions[action_pos].act.kill.signal= signal;
-               actions[action_pos].act.kill.pid= getpid();
-            }
-            ++action_pos;
-            break;
+            common_pid= getpid();
+            goto parse_kill_common;
          }
          if (strcmp(act_name, "run") == 0) {
-            if (action_pos < *n_actions)
-               actions[action_pos].op= ACT_RUN;
-            goto parse_exec_common;
+            common_op= ACT_RUN;
+            goto parse_run_common;
          }
       case 4:
          if (strcmp(act_name, "kill") == 0) {
-            pid_t pid;
-            int signal;
             if (n_el != 3)
                croak("Expected 2 parameters for 'kill' action");
             el= av_fetch(action_spec, 1, 0);
-            if (!el || !SvIOK(*el))
-               croak("Expected PID as first parameter to 'kill'");
-            pid= SvIV(*el);
-            el= av_fetch(action_spec, 2, 0);
             if (!el || !SvOK(*el))
-               croak("Expected Signal as second parameter to 'kill'");
-            signal= parse_signal(*el);
-            if (action_pos < *n_actions) {
-               actions[action_pos].op= ACT_KILL;
-               actions[action_pos].act.kill.pid= pid;
-               actions[action_pos].act.kill.signal= signal;
-            }
-            ++action_pos;
-            break;
+               croak("Expected Signal as first parameter to 'kill'");
+            common_signal= parse_signal(*el);
+            el= av_fetch(action_spec, 2, 0);
+            if (!el || !SvIOK(*el))
+               croak("Expected PID as second parameter to 'kill'");
+            common_pid= SvIV(*el);
+            goto parse_kill_common;
          }
          if (strcmp(act_name, "exec") == 0) {
-            if (action_pos < *n_actions)
-               actions[action_pos].op= ACT_EXEC;
-            parse_exec_common: // arriving from 'run', above
-            if (n_el < 2)
-               croak("Expected at least one parameter for '%s'", act_name);
-            // Align to pointer boundary within aux_buf
-            aux_pos += sizeof(void*) - 1;
-            aux_pos &= ~(sizeof(void*) - 1);
-            {
-               // allocate an array of char* within aux_buf
-               char **argv= aux_pos + sizeof(void*) * n_el <= *aux_len? (char**)(aux_buf + aux_pos) : NULL;
-               char *str;
-               STRLEN len;
-               int j, argc= n_el-1;
-               aux_pos += sizeof(void*) * (argc+1);
-               // size up each of the strings, and copy them to the buffer if space available
-               for (j= 0; j < argc; j++) {
-                  el= av_fetch(action_spec, j+1, 0);
-                  if (!el || !*el || !SvOK(*el))
-                     croak("Found undef element in arguments for '%s'", act_name);
-                  str= SvPV(*el, len);
-                  if (argv && aux_pos + len + 1 <= *aux_len) {
-                     argv[j]= aux_buf + aux_pos;
-                     memcpy(argv[j], str, len+1);
-                  }
-                  aux_pos += len+1;
-               }
-               // argv lists must end with NULL
-               if (argv)
-                  argv[argc]= NULL;
-               // store in an action if space remaining.
-               if (action_pos < *n_actions) {
-                  actions[action_pos].act.run.argc= argc;
-                  actions[action_pos].act.run.argv= argv;
-               }
-               ++action_pos;
-            }
-            break;
+            common_op= ACT_EXEC;
+            goto parse_run_common;
          }
       case 5:
          if (strcmp(act_name, "sleep") == 0) {
@@ -211,27 +167,245 @@ bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *au
                croak("Expected number of seconds in 'sleep' action");
             if (action_pos < *n_actions) {
                actions[action_pos].op= ACT_SLEEP;
+               actions[action_pos].orig_idx= spec_i;
                actions[action_pos].act.slp.seconds= SvNV(*el);
             }
             ++action_pos;
-            break;
+            continue;
+         }
+         if (strcmp(act_name, "close") == 0) {
+            common_op= ACT_x_CLOSE;
+            goto parse_close_common;
          }
       case 6:
          if (strcmp(act_name, "repeat") == 0) {
-            croak("Unimplemented");
+            int act_count= spec_i;
+            if (!act_count)
+               croak("'repeat' cannot be the first action");
+            if (n_el != 1) { // default is to repeat all, via act_count=i above
+               if (n_el != 2)
+                  croak("Expected 0 or 1 parameters to 'repeat'");
+               el= av_fetch(action_spec, 1, 0);
+               if (!el || !SvOK(*el) || !looks_like_number(*el) || SvIV(*el) <= 0)
+                  croak("Expected positive integer of actions to repeat");
+               act_count= SvIV(*el);
+            }
+            if (action_pos < *n_actions) {
+               int dest_act_idx, dest_spec_idx= spec_i - act_count;
+               // Locate the first action record with orig_idx == dest_spec_idx;
+               for (dest_act_idx= 0; dest_act_idx < spec_i; dest_act_idx++)
+                  if (actions[dest_act_idx].orig_idx == dest_spec_idx)
+                     break;
+               actions[action_pos].op= ACT_JUMP;
+               actions[action_pos].orig_idx= spec_i;
+               actions[action_pos].act.jmp.idx= dest_act_idx;
+            }
+            ++action_pos;
+            continue;
          }
-      case 8:
-         if (strcmp(act_name, "close_fd") == 0) {
-            croak("Unimplemented");
+         if (strcmp(act_name, "shut_r") == 0) {
+            common_op= ACT_x_SHUT_R;
+            goto parse_close_common;
+         }
+         if (strcmp(act_name, "shut_w") == 0) {
+            common_op= ACT_x_SHUT_W;
+            goto parse_close_common;
+         }
+      case 7:
+         if (strcmp(act_name, "shut_rw") == 0) {
+            common_op= ACT_x_SHUT_RW;
+            goto parse_close_common;
          }
       default:
          croak("Unknown command '%s' in action list", act_name);
+      }
+      if (0) parse_kill_common: { // arrive from 'kill' and 'sig'
+         // common_signal, common_pid will be set.
+         // Is there an available action?
+         if (action_pos < *n_actions) {
+            actions[action_pos].op= ACT_KILL;
+            actions[action_pos].orig_idx= spec_i;
+            actions[action_pos].act.kill.signal= common_signal;
+            actions[action_pos].act.kill.pid= common_pid;
+         }
+         ++action_pos;
+      }
+      if (0) parse_run_common: { // arrive from 'run' and 'exec'
+         char **argv= NULL, *str;
+         STRLEN len;
+         int j, argc= n_el-1;
+         // common_op will be set.
+         if (n_el < 2)
+            croak("Expected at least one parameter for '%s'", act_name);
+         // Align to pointer boundary within aux_buf
+         aux_pos += sizeof(void*) - 1;
+         aux_pos &= ~(sizeof(void*) - 1);
+         // allocate an array of char* within aux_buf
+         // argv remains NULL if there isn't room for it
+         if (aux_pos + sizeof(void*) * n_el <= *aux_len)
+            argv= (char**)(aux_buf + aux_pos);
+         aux_pos += sizeof(void*) * (argc+1);
+         // size up each of the strings, and copy them to the buffer if space available
+         for (j= 0; j < argc; j++) {
+            el= av_fetch(action_spec, j+1, 0);
+            if (!el || !*el || !SvOK(*el))
+               croak("Found undef element in arguments for '%s'", act_name);
+            str= SvPV(*el, len);
+            if (argv && aux_pos + len + 1 <= *aux_len) {
+               argv[j]= aux_buf + aux_pos;
+               memcpy(argv[j], str, len+1);
+            }
+            aux_pos += len+1;
+         }
+         // argv lists must end with NULL
+         if (argv)
+            argv[argc]= NULL;
+         // store in an action if space remaining.
+         if (action_pos < *n_actions) {
+            actions[action_pos].op= common_op;
+            actions[action_pos].orig_idx= spec_i;
+            actions[action_pos].act.run.argc= argc;
+            actions[action_pos].act.run.argv= argv;
+         }
+         ++action_pos;
+      }
+      if (0) parse_close_common: { // arrive from 'close', 'shut_r', 'shut_w', 'shut_rw'
+         int j;
+         const char *str;
+         STRLEN len;
+         // common_op will be set, and can be ORed with the variant
+         if (n_el < 2)
+            croak("Expected 1 or more parameters to '%s'", act_name);
+         // Each parameter is another action_fd or action_sockname action
+         for (j= 1; j < n_el; j++) {
+            el= av_fetch(action_spec, j, 0);
+            if (!el || !*el || !SvOK(*el))
+               croak("'%s' parameter %d is undefined", act_name, j-1);
+            // If not a ref...
+            if (!SvROK(*el)) {
+               // Is it a file descriptor integer?
+               if (looks_like_number(*el)) {
+                  IV fd= SvIV(*el);
+                  if (fd >= 0 && fd < 0x10000) {
+                     if (action_pos < *n_actions) {
+                        actions[action_pos].op= common_op | ACT_FD_x;
+                        actions[action_pos].orig_idx= spec_i;
+                        actions[action_pos].act.fd.fd= fd;
+                     }
+                     ++action_pos;
+                     continue;
+                  }
+               }
+               str= SvPV(*el, len);
+               // Is the length one of struct sockaddr_in, sockaddr_un, or sockaddr?
+               if (len == sizeof(struct sockaddr)
+                || len == sizeof(struct sockaddr_in)
+                || len == sizeof(struct sockaddr_un)
+               ) {
+                  if (action_pos < *n_actions) {
+                     actions[action_pos].op= common_op | ACT_PNAME_x;
+                     actions[action_pos].orig_idx= spec_i;
+                     actions[action_pos].act.nam.addr_len= len;
+                     actions[action_pos].act.nam.addr= (struct sockaddr*) (aux_buf+aux_pos);
+                  }
+                  if (aux_pos + len <= *aux_len)
+                     memcpy((aux_buf+aux_pos), str, len);
+                  aux_pos += len;
+                  action_pos++;
+                  continue;
+               }
+               // TODO: parse host:port strings
+            }
+            else {
+               // Try getting a file descriptor from the ref
+               int fd= fileno_from_sv(*el);
+               if (fd >= 0) {
+                  if (action_pos < *n_actions) {
+                     actions[action_pos].op= common_op | ACT_FD_x;
+                     actions[action_pos].orig_idx= spec_i;
+                     actions[action_pos].act.fd.fd= fd;
+                  }
+                  ++action_pos;
+                  continue;
+               }
+               // TODO: allow notation for socket self-name like { sockname => $x }
+               // and maybe allow a full pair of { sockname => $x, peername => $y }
+               // or even partial matches like { port => $num }
+            }
+            str= SvPV(*el, len);
+            croak("Invalid parameter to '%s': '%s'; must be integer (fileno), file handle, or socket name like from getpeername", act_name, str);
+         }
       }
    }
    success= (action_pos <= *n_actions) && (aux_pos <= *aux_len);
    *n_actions= action_pos;
    *aux_len= aux_pos;
    return success;
+}
+
+const char *act_fd_variant_name(int variant) {
+   switch (variant) {
+   case ACT_x_CLOSE: return "close";
+   case ACT_x_SHUT_R: return "shutdown SHUT_RD";
+   case ACT_x_SHUT_W: return "shutdown SHUT_WR";
+   case ACT_x_SHUT_RW: return "shutdown SHUT_RDWR";
+   default: return "BUG";
+   }
+}
+
+int snprintf_sockaddr(char *buffer, size_t buflen, struct sockaddr *addr) {
+   char tmp[256];
+   int port;
+   if (addr->sa_family == AF_INET) {
+      if (!inet_ntop(addr->sa_family, &((struct sockaddr_in*)addr)->sin_addr, tmp, sizeof(tmp)))
+         snprintf(tmp, sizeof(tmp), "(invalid?)");
+      port= ntohs(((struct sockaddr_in*)addr)->sin_port);
+      return snprintf(buffer, buflen, "inet %s:%d", tmp, port);
+   }
+#ifdef AF_INET6
+   else if (addr->sa_family == AF_INET6) {
+      if (!inet_ntop(addr->sa_family, &((struct sockaddr_in6*)addr)->sin6_addr, tmp, sizeof(tmp)))
+         snprintf(tmp, sizeof(tmp), "(invalid?)");
+      port= ntohs(((struct sockaddr_in6*)addr)->sin6_port);
+      return snprintf(buffer, buflen, "inet6 [%s]:%d", tmp, port);
+   }
+#endif
+#ifdef AF_UNIX
+   else if (addr->sa_family == AF_UNIX) {
+      return snprintf(buffer, buflen, "unix %s", ((struct sockaddr_un*)addr)->sun_path);
+   }
+#endif
+}
+
+int snprintf_action(char *buffer, size_t buflen, struct action *act) {
+   int low= act->op & 0xF;
+   int high= act->op & ~0xF;
+   switch (high) {
+   case ACT_KILL:  return snprintf(buffer, buflen, "kill sig=%d pid=%d", (int)act->act.kill.signal, (int) act->act.kill.pid);
+   case ACT_SLEEP: return snprintf(buffer, buflen, "sleep %.3lfs", (double)act->act.slp.seconds);
+   case ACT_JUMP:  return snprintf(buffer, buflen, "goto %d", (int)act->act.jmp.idx);
+   case ACT_FD_x:  return snprintf(buffer, buflen, "%s %d", act_fd_variant_name(low), act->act.fd.fd);
+   case ACT_PNAME_x:
+   case ACT_SNAME_x: {
+      int pos= snprintf(buffer, buflen, "%s %s ",
+         act_fd_variant_name(low),
+         high == ACT_PNAME_x? "peername":"sockname"
+      );
+      return pos + snprintf_sockaddr(buffer+pos, buflen > pos? buflen-pos : 0, act->act.nam.addr);
+   }
+   case ACT_EXEC: {
+      int i, pos= snprintf(buffer, buflen, "%sexec(", act->op == ACT_RUN? "fork,fork," : "");
+      for (i= 0; i < act->act.run.argc; i++) {
+         pos += snprintf(buffer+pos, buflen > pos? buflen-pos : 0, "'%s',", act->act.run.argv[i]);
+      }
+      // if still in bounds, overwrite final character with ')'
+      if (pos < buflen)
+         buffer[pos-1]= ')';
+      return pos;
+   }
+   default:
+      return snprintf(buffer, buflen, "BUG: action code %d", act->op);
+   }
 }
 
 struct socketalarm *
@@ -626,6 +800,29 @@ cancel(alarm)
    struct socketalarm *alarm
    CODE:
       RETVAL= watch_list_remove(alarm);
+   OUTPUT:
+      RETVAL
+
+SV*
+stringify(alarm)
+   struct socketalarm *alarm
+   INIT:
+      SV *out= sv_2mortal(newSVpvn("",0));
+      int i;
+   CODE:
+      sv_catpvf(out, "watch fd: %d\n", alarm->watch_fd);
+      sv_catpvf(out, "event mask:%s%s\n",
+         alarm->event_mask & EVENT_EOF? " EOF":"",
+         alarm->event_mask & EVENT_EPIPE? " EPIPE":""
+      );
+      sv_catpv(out, "actions:\n");
+      for (i= 0; i < alarm->action_count; i++) {
+         char buf[256];
+         snprintf_action(buf, sizeof(buf), alarm->actions+i);
+         sv_catpvf(out, "%4d: %s\n", i, buf);
+      }
+      SvREFCNT_inc(out);
+      RETVAL= out;
    OUTPUT:
       RETVAL
 
