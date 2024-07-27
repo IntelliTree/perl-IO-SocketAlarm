@@ -3,6 +3,9 @@
 // Returns false when time to exit
 static bool do_watch();
 
+#define WATCHTHREAD_DEBUG(fmt, ...) (void) write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
+#define WATCHTHREAD_WARN(fmt, ...) (void) write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
+
 void* watch_thread_main(void* unused) {
    while (do_watch()) {}
    return NULL;
@@ -12,7 +15,7 @@ void* watch_thread_main(void* unused) {
 bool do_watch() {
    struct pollfd *pollset;
    struct timespec wake_time= { 0, -1 };
-   int capacity, buckets, n_poll, ofs, i, j, n, delay= 10000;
+   int capacity, buckets, sz, n_poll, ofs, i, j, n, delay= 10000;
    char msgbuf[128];
    
    if (pthread_mutex_lock(&watch_list_mutex))
@@ -24,16 +27,15 @@ bool do_watch() {
    // thread support.
    capacity= watch_list_count > 1024? 1024 : watch_list_count+1;
    buckets= capacity < 16? 16 : capacity < 128? 32 : 64;
-   pollset= (struct pollfd *) alloca(
-      sizeof(struct pollfd) * capacity
-      + POLLFD_RBHASH_SIZEOF(capacity, buckets)
-   );
+   sz= sizeof(struct pollfd) * capacity + POLLFD_RBHASH_SIZEOF(capacity, buckets);
+   pollset= (struct pollfd *) alloca(sz);
+   memset(pollset, 0, sz);
    
    // first fd is always our control socket
    pollset[0].fd= control_pipe[0];
    pollset[0].events= POLLIN;
    n_poll= 1;
-   
+   WATCHTHREAD_DEBUG("watch_thread loop iter, watch_list_count=%d capacity=%d buckets=%d\n", watch_list_count, capacity, buckets);
    for (i= 0, n= watch_list_count; i < n && n_poll < capacity; i++) {
       struct socketalarm *alarm= watch_list[i];
       int fd= alarm->watch_fd;
@@ -42,7 +44,7 @@ bool do_watch() {
          continue;
       ofs= -1 + (int)pollfd_rbhash_insert(pollset+capacity, capacity, n_poll+1, fd & (buckets-1), fd);
       if (ofs < 0) { // corrupt datastruct, should never happen
-         write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), "BUG: corrupt pollfd_rbhash"));
+         WATCHTHREAD_WARN("BUG: corrupt pollfd_rbhash");
          break;
       }
       if (ofs == n_poll) { // using the new uninitialized one?
@@ -79,19 +81,28 @@ bool do_watch() {
             delay= wake_delay;
       }
    }
+   WATCHTHREAD_DEBUG("poll(n=%d delay=%d)\n", n_poll, delay);
    if (poll(pollset, n_poll, delay < 0? 0 : delay) < 0) {
       perror("poll");
       return false;
+   }
+   for (i= 0; i < n_poll; i++) {
+      WATCHTHREAD_DEBUG("  fd=%3d revents=%02X\n", pollset[i].fd, pollset[i].revents);
    }
    
    // First, did we get new control messages?
    if (pollset[0].revents & POLLIN) {
       char msg;
-      if (read(pollset[0].fd, &msg, 1) != 1) // should never fail
+      if (read(pollset[0].fd, &msg, 1) != 1) { // should never fail
+         WATCHTHREAD_DEBUG("read != 1\n");
          return false;
-      if (msg == CONTROL_TERMINATE) // intentional exit
+      }
+      if (msg == CONTROL_TERMINATE) {// intentional exit
+         WATCHTHREAD_DEBUG("terminate received\n");
          return false;
+      }
       // else its CONTROL_REWATCH, which means we should start over with new alarms to watch
+      WATCHTHREAD_DEBUG("got REWATCH, starting over\n");
       return true;
    }
    
@@ -113,10 +124,10 @@ bool do_watch() {
          bool trigger= false;
          int events= alarm->event_mask;
          if (events & EVENT_EOF) {
-            //if (pollset[poll_idx].revents & POLLHUP)
-            //   trigger= true;
-            //else if (pollset[poll_idx].revents & POLLIN) {
-            //   
+            if (pollset[poll_idx].revents & POLLHUP)
+               trigger= true;
+            else if (pollset[poll_idx].revents & POLLIN)
+               trigger= true;
             //}
          }
          if (trigger)

@@ -289,6 +289,7 @@ socketalarm(sock_sv, ...)
          }
       }
       RETVAL= socketalarm_new(sock_fd, eventmask, &(ST(action_ofs)), items - action_ofs);
+      watch_list_add(RETVAL);
    OUTPUT:
       RETVAL
 
