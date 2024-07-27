@@ -216,12 +216,6 @@ just immediately C<exit>s.
 
 Wait before running the next action.
 
-=item repeat
-
-  [ repeat => $n ],
-
-Repeat the previous C<$n> actions.
-
 =back
 
 =head3 triggered

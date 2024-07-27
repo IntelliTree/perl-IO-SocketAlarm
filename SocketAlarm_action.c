@@ -87,31 +87,33 @@ bool parse_actions(SV **spec, int n_spec, struct action *actions, size_t *n_acti
             goto parse_close_common;
          }
       case 6:
-         if (strcmp(act_name, "repeat") == 0) {
-            int act_count= spec_i;
-            if (!act_count)
-               croak("'repeat' cannot be the first action");
-            if (n_el != 1) { // default is to repeat all, via act_count=i above
-               if (n_el != 2)
-                  croak("Expected 0 or 1 parameters to 'repeat'");
-               el= av_fetch(action_spec, 1, 0);
-               if (!el || !SvOK(*el) || !looks_like_number(*el) || SvIV(*el) <= 0)
-                  croak("Expected positive integer of actions to repeat");
-               act_count= SvIV(*el);
-            }
-            if (action_pos < *n_actions) {
-               int dest_act_idx, dest_spec_idx= spec_i - act_count;
-               // Locate the first action record with orig_idx == dest_spec_idx;
-               for (dest_act_idx= 0; dest_act_idx < spec_i; dest_act_idx++)
-                  if (actions[dest_act_idx].orig_idx == dest_spec_idx)
-                     break;
-               actions[action_pos].op= ACT_JUMP;
-               actions[action_pos].orig_idx= spec_i;
-               actions[action_pos].act.jmp.idx= dest_act_idx;
-            }
-            ++action_pos;
-            continue;
-         }
+         // The repeat feature opens the possibility of infinite busy-loops,
+         // and probably creates more problems than it solves.
+         //if (strcmp(act_name, "repeat") == 0) {
+         //   int act_count= spec_i;
+         //   if (!act_count)
+         //      croak("'repeat' cannot be the first action");
+         //   if (n_el != 1) { // default is to repeat all, via act_count=i above
+         //      if (n_el != 2)
+         //         croak("Expected 0 or 1 parameters to 'repeat'");
+         //      el= av_fetch(action_spec, 1, 0);
+         //      if (!el || !SvOK(*el) || !looks_like_number(*el) || SvIV(*el) <= 0)
+         //         croak("Expected positive integer of actions to repeat");
+         //      act_count= SvIV(*el);
+         //   }
+         //   if (action_pos < *n_actions) {
+         //      int dest_act_idx, dest_spec_idx= spec_i - act_count;
+         //      // Locate the first action record with orig_idx == dest_spec_idx;
+         //      for (dest_act_idx= 0; dest_act_idx < spec_i; dest_act_idx++)
+         //         if (actions[dest_act_idx].orig_idx == dest_spec_idx)
+         //            break;
+         //      actions[action_pos].op= ACT_JUMP;
+         //      actions[action_pos].orig_idx= spec_i;
+         //      actions[action_pos].act.jmp.idx= dest_act_idx;
+         //   }
+         //   ++action_pos;
+         //   continue;
+         //}
          if (strcmp(act_name, "shut_r") == 0) {
             common_op= ACT_x_SHUT_R;
             goto parse_close_common;
@@ -283,9 +285,9 @@ bool execute_action(struct action *act, bool resume, struct timespec *now_ts, st
          return true; // reached end_ts
       return false; // still waiting
    }
-   case ACT_JUMP:
-      parent->cur_action= act->act.jmp.idx - 1; // parent will ++ after we return true
-      return true;
+   //case ACT_JUMP:
+   //   parent->cur_action= act->act.jmp.idx - 1; // parent will ++ after we return true
+   //   return true;
    case ACT_FD_x:
       switch (low) {
       case ACT_x_SHUT_R: how= SHUT_RD; if (0)
@@ -372,7 +374,7 @@ int snprint_action(char *buffer, size_t buflen, struct action *act) {
    switch (high) {
    case ACT_KILL:  return snprintf(buffer, buflen, "kill sig=%d pid=%d", (int)act->act.kill.signal, (int) act->act.kill.pid);
    case ACT_SLEEP: return snprintf(buffer, buflen, "sleep %.3lfs", (double)act->act.slp.seconds);
-   case ACT_JUMP:  return snprintf(buffer, buflen, "goto %d", (int)act->act.jmp.idx);
+   //case ACT_JUMP:  return snprintf(buffer, buflen, "goto %d", (int)act->act.jmp.idx);
    case ACT_FD_x:  return snprintf(buffer, buflen, "%s %d", act_fd_variant_name(low), act->act.fd.fd);
    case ACT_PNAME_x:
    case ACT_SNAME_x: {

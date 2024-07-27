@@ -28,11 +28,10 @@ struct action_run {
 };
 struct action_sleep {
    double seconds;
-   struct timespec end_ts; // used during execution
 };
-struct action_jump {
-   int idx;
-};
+//struct action_jump {
+//   int idx;
+//};
 struct action {
    int op;       // one of the ACT_* enum codes
    int orig_idx; // offset in original arrayref of actions
@@ -42,7 +41,7 @@ struct action {
       struct action_sockname   nam;
       struct action_run        run;
       struct action_sleep      slp;
-      struct action_jump       jmp;
+      //struct action_jump       jmp;
    } act;
 };
 

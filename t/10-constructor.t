@@ -34,12 +34,13 @@ my @tests= (
    {  spec   => [ [ shut_rw => 0 ] ],
       result => [ 'shutdown SHUT_RDWR 0' ],
    },
-   {  spec   => [ [ sig => 10 ], [ sleep => 1 ], [ 'repeat' ] ],
-      result => [ "kill sig=10 pid=$$", 'sleep 1.000s', 'goto 0' ],
-   },
-   {  spec   => [ [ sleep => 1 ], [ close => 1, 2, 3, 4, 5 ], [ sleep => 1 ], [ repeat => 2 ] ],
-      result => [ 'sleep 1.000s', 'close 1', 'close 2', 'close 3', 'close 4', 'close 5', 'sleep 1.000s', 'goto 1' ],
-   },
+   # 'repeat' feature is probably more trouble than it is worth
+   #{  spec   => [ [ sig => 10 ], [ sleep => 1 ], [ 'repeat' ] ],
+   #   result => [ "kill sig=10 pid=$$", 'sleep 1.000s', 'goto 0' ],
+   #},
+   #{  spec   => [ [ sleep => 1 ], [ close => 1, 2, 3, 4, 5 ], [ sleep => 1 ], [ repeat => 2 ] ],
+   #   result => [ 'sleep 1.000s', 'close 1', 'close 2', 'close 3', 'close 4', 'close 5', 'sleep 1.000s', 'goto 1' ],
+   #},
 );
 
 socket my $s, AF_INET, SOCK_STREAM, 0;
