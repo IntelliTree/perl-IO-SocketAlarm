@@ -34,7 +34,7 @@ struct socketalarm {
    int action_count;
    int cur_action;          // used during execution
    struct timespec wake_ts; // used during execution
-   HV *owner;
+   SV *owner;
    struct action actions[];
 };
 
@@ -146,12 +146,25 @@ get_magic_socketalarm(SV *obj, int flags) {
    return NULL;
 }
 
+static void attach_magic_socketalarm(SV *obj_inner_sv, struct socketalarm *sa) {
+   MAGIC *magic;
+   if (sa->owner)
+      croak("BUG: already attached to perl object");
+   sa->owner= obj_inner_sv;
+   magic= sv_magicext((SV*) sa->owner, NULL, PERL_MAGIC_ext, &socketalarm_magic_vt, (const char*) sa, 0);
+#ifdef USE_ITHREADS
+   magic->mg_flags |= MGf_DUP;
+#else
+   (void)magic; // suppress 'unused' warning
+#endif
+}
+
 // Return existing Watch object, or create a new one.
 // Returned SV has a non-mortal refcount, which is what the typemap
 // wants for returning a "struct socketalarm*" to perl-land
 static SV* wrap_socketalarm(struct socketalarm *sa) {
    SV *obj;
-   MAGIC *magic;
+   HV *hv;
    // Since this is used in typemap, handle NULL gracefully
    if (!sa)
       return &PL_sv_undef;
@@ -159,15 +172,10 @@ static SV* wrap_socketalarm(struct socketalarm *sa) {
    if (sa->owner)
       return newRV_inc((SV*) sa->owner);
    // else create a node object
-   sa->owner= newHV();
-   obj= newRV_noinc((SV*) sa->owner);
+   hv= newHV();
+   obj= newRV_noinc((SV*) hv);
    sv_bless(obj, gv_stashpv("IO::SocketAlarm", GV_ADD));
-   magic= sv_magicext((SV*) sa->owner, NULL, PERL_MAGIC_ext, &socketalarm_magic_vt, (const char*) sa, 0);
-#ifdef USE_ITHREADS
-   magic->mg_flags |= MGf_DUP;
-#else
-   (void)magic; // suppress 'unused' warning
-#endif
+   attach_magic_socketalarm((SV*) hv, sa);
    return obj;
 }
 
@@ -182,26 +190,39 @@ static SV * new_enum_dualvar(pTHX_ IV ival, SV *name) {
 
 MODULE = IO::SocketAlarm               PACKAGE = IO::SocketAlarm
 
-struct socketalarm *
-_new_socketalarm(sock_sv, eventmask, actions)
+void
+_init_socketalarm(self, sock_sv, eventmask_sv, actions_sv)
+   SV *self
    SV *sock_sv
-   int eventmask
-   AV *actions
+   SV *eventmask_sv
+   SV *actions_sv
    INIT:
       int sock_fd= fileno_from_sv(sock_sv);
+      int eventmask= EVENT_EOF | EVENT_EPIPE;
       struct stat statbuf;
+      struct socketalarm *sa;
       SV **action_list= NULL;
+      AV *actions;
       size_t n_actions= 0;
-   CODE:
+   PPCODE:
+      if (!sv_isobject(self))
+         croak("Not an object");
+      if ((sa= get_magic_socketalarm(self, 0)))
+         croak("Already initialized");
       if (!(sock_fd >= 0 && fstat(sock_fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode)))
          croak("Not an open socket");
-      if (actions != NULL) {
+      if (eventmask_sv && SvOK(eventmask_sv))
+         eventmask= SvIV(eventmask_sv);
+      if (actions_sv && SvOK(actions_sv)) {
+         if (!(SvROK(actions_sv) && SvTYPE(SvRV(actions_sv)) == SVt_PVAV))
+            croak("Actions must be an arrayref (or undefined)");
+         actions= (AV*) SvRV(actions_sv);
          n_actions= av_count(actions);
          action_list= AvARRAY(actions);
       }
-      RETVAL= socketalarm_new(sock_fd, eventmask, action_list, n_actions);
-   OUTPUT:
-      RETVAL
+      sa= socketalarm_new(sock_fd, eventmask, action_list, n_actions);
+      attach_magic_socketalarm(SvRV(self), sa);
+      XSRETURN(1); // return $self
 
 bool
 start(alarm)

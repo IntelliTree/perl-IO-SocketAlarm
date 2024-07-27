@@ -1,9 +1,16 @@
 use Test2::V0;
 use Socket ':all';
+use POSIX ':signal_h';
 use File::Temp;
 use IO::SocketAlarm;
 
 my @tests= (
+   {  spec   => [],
+      result => [ "kill sig=".SIGALRM." pid=$$" ],
+   },
+   {  spec   => undef,
+      result => [ "kill sig=".SIGALRM." pid=$$" ],
+   },
    {  spec   => [ [ sleep => 1 ] ],
       result => [ 'sleep 1.000s' ],
    },
@@ -52,7 +59,7 @@ for my $test (@tests) {
       "actions:",
       (map sprintf("%4d: %s", $_, $test->{result}[$_]), 0..$#{$test->{result}}),
       '';
-   my $sa= IO::SocketAlarm::_new_socketalarm($s, 0, $test->{spec});
+   my $sa= IO::SocketAlarm->new(socket => $s, events => 0, actions => $test->{spec});
    is( $sa->stringify, $expected, $name );
 }
 

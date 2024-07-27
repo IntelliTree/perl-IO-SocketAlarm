@@ -94,6 +94,19 @@ use the same precautions that you would use when using C<alarm()>.
 
 When triggered, the alarm only runs its actions once.
 
+=head2 Constructor
+
+=head3 new
+
+=cut
+
+sub new {
+   my $class= shift;
+   my %attrs= @_ == 1 && ref $_[0] eq 'HASH'? %{$_[0]} : @_;
+   my $self= bless \%attrs, $class;
+   $self->_init_socketalarm(@attrs{'socket','events','actions'});
+}
+
 =head2 Attributes
 
 =head3 socket
