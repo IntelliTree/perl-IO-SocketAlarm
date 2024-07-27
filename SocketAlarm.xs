@@ -45,11 +45,11 @@ static void socketalarm_exec_actions(struct socketalarm *sa);
 #include "SocketAlarm_watcher.c"
 
 struct socketalarm *
-socketalarm_new(int watch_fd, int event_mask, AV *action_spec) {
+socketalarm_new(int watch_fd, int event_mask, SV **action_spec, size_t spec_count) {
    size_t n_actions= 0, aux_len= 0, len_before_aux;
    struct socketalarm *self= NULL;
 
-   parse_actions(action_spec, NULL, &n_actions, NULL, &aux_len);
+   parse_actions(action_spec, spec_count, NULL, &n_actions, NULL, &aux_len);
    // buffer needs aligned to pointer, which sizeof(struct action) is not guaranteed to be
    len_before_aux= sizeof(struct socketalarm) + n_actions * sizeof(struct action);
    len_before_aux += sizeof(void*)-1;
@@ -57,7 +57,7 @@ socketalarm_new(int watch_fd, int event_mask, AV *action_spec) {
    self= (struct socketalarm *) safecalloc(1, len_before_aux + aux_len);
    // second call should succeed, because we gave it back it's own requested buffer sizes.
    // could fail if user did something evil like a tied scalar that changes length...
-   if (!parse_actions(action_spec, self->actions, &n_actions, ((char*)self) + len_before_aux, &aux_len))
+   if (!parse_actions(action_spec, spec_count, self->actions, &n_actions, ((char*)self) + len_before_aux, &aux_len))
       croak("BUG: buffers not large enough for parse_actions");
    self->watch_fd= watch_fd;
    self->event_mask= event_mask;
@@ -190,10 +190,16 @@ _new_socketalarm(sock_sv, eventmask, actions)
    INIT:
       int sock_fd= fileno_from_sv(sock_sv);
       struct stat statbuf;
+      SV **action_list= NULL;
+      size_t n_actions= 0;
    CODE:
       if (!(sock_fd >= 0 && fstat(sock_fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode)))
          croak("Not an open socket");
-      RETVAL= socketalarm_new(sock_fd, eventmask, actions);
+      if (actions != NULL) {
+         n_actions= av_count(actions);
+         action_list= AvARRAY(actions);
+      }
+      RETVAL= socketalarm_new(sock_fd, eventmask, action_list, n_actions);
    OUTPUT:
       RETVAL
 
@@ -242,6 +248,28 @@ _terminate_all()
       shutdown_watch_thread();
 
 MODULE = IO::SocketAlarm               PACKAGE = IO::SocketAlarm::Util
+
+struct socketalarm *
+socketalarm(sock_sv, ...)
+   SV *sock_sv
+   INIT:
+      int sock_fd= fileno_from_sv(sock_sv);
+      int eventmask= EVENT_EOF|EVENT_EPIPE;
+      int action_ofs= 1;
+      struct stat statbuf;
+   CODE:
+      if (!(sock_fd >= 0 && fstat(sock_fd, &statbuf) == 0 && S_ISSOCK(statbuf.st_mode)))
+         croak("Not an open socket");
+      if (items > 1) {
+         // must either be a scalar, a scalar followed by actions specs, or action specs
+         if (SvOK(ST(1)) && looks_like_number(ST(1))) {
+            eventmask= SvIV(ST(1));
+            action_ofs++;
+         }
+      }
+      RETVAL= socketalarm_new(sock_fd, eventmask, &(ST(action_ofs)), items - action_ofs);
+   OUTPUT:
+      RETVAL
 
 bool
 is_socket(fd_sv)

@@ -13,7 +13,7 @@ XSLoader::load('IO::SocketAlarm', $IO::SocketAlarm::VERSION);
 # All exports are part of the Util sub-package.
 # They are declared in XS
 package IO::SocketAlarm::Util {
-   our @EXPORT_OK= qw( render_fd_table is_socket );
+   our @EXPORT_OK= qw( socketalarm get_fd_table_str is_socket );
    use Exporter 'import';
 }
 
@@ -144,9 +144,11 @@ also possible you called C<bind> on the socket to set a new name...
   actions => [ [ sig => SIGALRM ] ],
 
 The C<@actions> are an array of one or more action specifications.  When the C<$events> are
-detected, this list will be performed in sequence.  You can't just specify a coderef for an
-action because they run in a separate C thread that isn't permitted to touch the perl
-interpreter.  The available actions are:
+detected, this list will be performed in sequence.  The actions are described as simple
+lisp-like arrayrefs. (you can't just specify a coderef for an action because they run in a
+separate C thread that isn't able to touch the perl interpreter.)
+
+The available actions are:
 
 =over
 
@@ -158,30 +160,45 @@ Send yourself a signal. The signal constants come from C<< use POSIX ':signal_h'
 
 =item kill
 
-  [ kill => $pid, $signal ],
+  [ kill => $signal, $pid ],
 
-Send a signal to any process.
+Send a signal to any process.  Note the order of arguments: this is the same as Perl and bash,
+but the opposite of the C library, and a mixup can be bad!
 
-=item close_fd
+=item close
 
-  [ close => $fd1, $fd2, $fd3... ],
+  [ close => $fd_or_sockname, ... ],
 
-Close one or more file descriptors.  This could have uses like killing database connections.
+Close one or more file descriptors or socket names.  This could have uses like killing database
+connections when you know the file handle number or host:port of the database server.
 
-=item close_name
+If the parameter is an integer, it is assumed to be a raw file descriptor number like you get
+from C<fileno>.  If the parameter is an IO::Handle, it calls C<fileno> for you, and croaks if
+that handle isn't backed by a real file descriptor.  The parameter can also be a byte string
+as per the C<getpeername> function; in this case B<all> sockets connected to that peer name will
+be closed.
 
-  [ close_all => $sockname1, $sockname2... ],
+=item shut_r, shut_w, shut_rw
 
-Close all sockets which are connected to one of the given names.  These "names" are byte
-strings as per the C<getpeername> function.  You can either specify one directly, or provide
-them as "$host_ip:$portnumber" and the library will convert to a socket name for you.
+  [ shut_r => $fd_or_sockname, ... ],
+  [ shut_w => $fd_or_sockname, ... ],
+  [ shut_rw => $fd_or_sockname, ... ],
+
+Like C<close>, but instead of calling C<close(fd)> it calls the socket function
+C<< shutdown(fd, $how) >> where C<$how> is one of SHUT_RD, SHUT_RW, SHUT_RDWR.  This leaves the
+socket open, but causes reads or writes to fail, which may give a more graceful cancellation of
+whatever was happening over that socket.
 
 =item run
 
   [ run => @argv ],
 
-Fork and exec an external program.  The program shares your STDOUT and STDERR, but is connected
-to /dev/null on STDIN.  The library does not wait to see whether the program succeeded.
+Fork (twice) and exec an external program.  The program shares your STDOUT and STDERR, but is
+connected to /dev/null on STDIN.  The double-fork (and reap of first forked child) allows the
+(grand)child process to run independently from the current process, and get reaped by C<init>,
+and not tangle up whatever you might be doing with C<waitpid>.  If the C<exec> fails, it is
+reported on C<STDERR>, but the current process has no way to inspect the outcome of the C<exec>
+or the status of the program.
 
 =item exec
 
@@ -190,7 +207,8 @@ to /dev/null on STDIN.  The library does not wait to see whether the program suc
 Replace the current running process with a different process, just like C<exec>.  This
 completely aborts the main perl script and loses any work, without calling 'atexit' or any
 other cleanup your perl script might have intended to do.  Sometimes, this is what you want,
-though.  This can fail if C<< $argv[0] >> isn't found in the PATH.
+though.  This can fail if C<< $argv[0] >> isn't found in the PATH, in which case your program
+just immediately C<exit>s.
 
 =item sleep
 
@@ -224,6 +242,9 @@ to this call.  (i.e. whether the call changed the state of the alarm)
 
 =cut
 
+# Before global destruction, de-activate the alarms and ask the watcher thread to terminate.
+# This way bizarre things don't happen when global destruction starts calling destructors
+# in the wrong order.
 END { _terminate_all() }
 
 1;

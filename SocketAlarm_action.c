@@ -1,10 +1,20 @@
-bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *aux_buf, size_t *aux_len) {
+bool parse_actions(SV **spec, int n_spec, struct action *actions, size_t *n_actions, char *aux_buf, size_t *aux_len) {
    bool success;
    size_t action_pos= 0;
    size_t aux_pos= 0;
-   int spec_i, n_spec= av_len(spec)+1;
+   int spec_i;
 
-   for (spec_i= 0; spec_i < n_spec; spec_i++) {
+   // Default is one SIGALRM to self
+   if (!spec || n_spec == 0) {
+      if (*n_actions) {
+         actions[0].op= ACT_KILL;
+         actions[0].orig_idx= 0;
+         actions[0].act.kill.signal= SIGALRM;
+         actions[0].act.kill.pid= getpid();
+      }
+      action_pos++;
+   }
+   else for (spec_i= 0; spec_i < n_spec; spec_i++) {
       AV *action_spec;
       const char *act_name= NULL;
       STRLEN act_namelen= 0;
@@ -14,13 +24,12 @@ bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *au
       int common_op, common_signal;
 
       // Get the arrayref for the next action
-      el= av_fetch(spec, spec_i, 0);
-      if (!(el && *el && SvROK(*el) && SvTYPE(SvRV(*el)) == SVt_PVAV))
+      if (!(spec[spec_i] && SvROK(spec[spec_i]) && SvTYPE(SvRV(spec[spec_i])) == SVt_PVAV))
          croak("Actions must be arrayrefs");
 
       // Get the 'command' name of the action
-      action_spec= (AV*) SvRV(*el);
-      n_el= av_len(action_spec)+1;
+      action_spec= (AV*) SvRV(spec[spec_i]);
+      n_el= av_count(action_spec);
       if (n_el < 1 || !(el= av_fetch(action_spec, 0, 0)) || !SvPOK(*el))
          croak("First element of action must be a string");
       act_name= SvPV(*el, act_namelen);

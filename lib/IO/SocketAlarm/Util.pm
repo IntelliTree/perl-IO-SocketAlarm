@@ -7,6 +7,20 @@ __END__
 
 =head1 EXPORTS
 
+=head2 socketalarm
+
+  $alarm= socketalarm($socket);
+  $alarm= socketalarm($socket, @actions);
+  $alarm= socketalarm($socket, $event_mask, @actions);
+
+This is a shortcut for L<IO::SocketAlarm-E<gt>new|IO::SocketAlarm/new>:
+
+  $alarm= IO::SocketAlarm->new(
+    socket => $socket,
+    events => $event_mask,
+    actions => \@actions,
+  );
+
 =head2 is_socket
 
   $bool= is_socket($thing);
