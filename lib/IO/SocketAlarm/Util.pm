@@ -25,13 +25,15 @@ This is a shortcut for L<IO::SocketAlarm-E<gt>new|IO::SocketAlarm/new>:
 
   $bool= is_socket($thing);
 
-Returns true if and only if the parameter is a socket.  It permits file handles or file
-descriptor numbers.
+Returns true if and only if the parameter is a socket at the operating system level.
+(for instance, the socket must not have been C<close>d, which would release that file
+descriptor) It permits file handles or file descriptor numbers.
 
-=head2 render_fd_table
+=head2 get_fd_table_str
 
-  $str= render_fd_table();
+  $str= get_fd_table();        // scans fd 0..1023
+  $str= get_fd_table($max_fd); // specify your own upper limit
 
-Return a string describing the current open file descriptors of this process.
-
-
+Return a human-readable string describing each open file descriptor.  This is just for
+debugging, and relies on /proc/self/fd/ symlinks for anything other than sockets.
+For sockets, it prints the bound name and peer name of the socket.

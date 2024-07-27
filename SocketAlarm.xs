@@ -283,7 +283,7 @@ is_socket(fd_sv)
       RETVAL
 
 SV *
-render_fd_table(max_fd=1024)
+get_fd_table_str(max_fd=1024)
    int max_fd
    INIT:
       SV *out= newSVpvn("",0);

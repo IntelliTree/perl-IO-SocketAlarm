@@ -163,6 +163,104 @@ int snprint_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
    return len;
 }
 
+#if 0
+// neat idea, but no real need for it right now
+int get_fd_table(AV *out, int max_fd) {
+   struct stat statbuf;
+   size_t len= 0;
+   int i, j, k, n_closed;
+   pid_t pid= 0;
+
+   for (i= 0; i < max_fd; i++) {
+      if (fstat(i, &statbuf) < 0)
+         continue;
+      else if (!S_ISSOCK(statbuf.st_mode)) {
+         char pathbuf[64];
+         char linkbuf[256];
+         int got;
+         if (!pid) pid= getpid();
+         
+         // Prefer whatever /proc/sel/fd/N says.
+         snprintf(pathbuf, sizeof(pathbuf), "/proc/%d/fd/%d", pid, i);
+         pathbuf[sizeof(pathbuf)-1]= '\0';
+         got= readlink(pathbuf, linkbuf, sizeof(linkbuf));
+         if (got > 0 && got <= sizeof(linkbuf)) {
+            sv= newSVpvn(linkbuf, got);
+         }
+         // for systems without /prod/self/fd, give a simple approximation
+         else if (S_ISREG(statbuf.st_mode)) {
+            sv= newSVpvs("file");
+         } else if (S_ISDIR(statbuf.st_mode)) {
+            sv= newSVpvs("dir");
+         } else if (S_ISCHR(statbuf.st_mode)) {
+            sv= newSVpvs("chardevice");
+         } else if (S_ISBLK(statbuf.st_mode)) {
+            sv= newSVpvs("blockdev");
+         } else if (S_ISFIFO(statbuf.st_mode)) {
+            sv= newSVpvs("pipe");
+         } else {
+            sv= newSVpvs("unknown");
+         }
+      }
+      else {
+         SV *sname= NULL, *pname= NULL;
+         int protocol= -1, family= -1;
+         const char *clname;
+         struct sockaddr_storage addr;
+         socklen_t addr_len= sizeof(addr);
+         if (getsockname(i, (struct sockaddr*) &addr, &addr_len) == 0) {
+            sname= newSVpvn((char*) &addr, addr_len);
+            family= addr.ss_family;
+         }
+
+         addr_len= sizeof(addr);
+         if (getpeername(i, (struct sockaddr*) &addr, &addr_len) == 0) {
+            pname= newSVpvn((char*) &addr, addr_len);
+            family= addr.ss_family;
+         }
+
+         if (family == -1) {
+            int len = sizeof(family);
+            if (getsockopt(i, SOL_SOCKET, SO_FAMILY, &family, &len) == -1) {
+               perror("getsockopt SO_FAMILY");
+               family= -1;
+            }
+         }
+
+         if (protocol == -1) {
+            int len = sizeof(family);
+            if (getsockopt(i, SOL_SOCKET, SO_PROTOCOL, &protocol, &len) == -1) {
+               perror("getsockopt SO_PROTOCOL");
+               protocol= -1;
+            }
+         }
+
+         if (family == AF_INET) {
+            clname= (protocol == SOCK_STREAM)? "IO::SocketAlarm::FdInfo::TCP"
+               : (protocol == SOCK_DGRAM)? "IO::SocketAlarm::FdInfo::UDP"
+               : "IO::SocketAlarm::FdInfo::INET";
+         }
+#ifdef AF_INET6
+         else if (family == AF_INET6) {
+            clname= (protocol == SOCK_STREAM)? "IO::SocketAlarm::FdInfo::TCP6"
+               : (protocol == SOCK_DGRAM)? "IO::SocketAlarm::FdInfo::UDP6"
+               : "IO::SocketAlarm::FdInfo::INET6";
+         }
+#endif
+#ifdef AF_UNIX
+         else if (family == AF_UNIX) {
+            clname= (protocol == SOCK_STREAM)? "IO::SocketAlarm::FdInfo::UNIX"
+               : (protocol == SOCK_DGRAM)? "IO::SocketAlarm::FdInfo::UNIX_DGRAM"
+               : (protocol == SOCK_SEQPACKET)? "IO::SocketAlarm::FdInfo::UNIX_SEQPACKET"
+               : "IO::SocketAlarm::FdInfo::UNIX";
+         }
+#endif
+         else clname= "IO::SocketAlarm::FdInfo";
+      }
+   }
+}
+#endif
+
 // This loads now_ts with the current clock time if it was not already initialized.
 // Use tv_nsec == -1 as an indicator of being uninitialized.
 bool lazy_build_now_ts(struct timespec *now_ts) {
