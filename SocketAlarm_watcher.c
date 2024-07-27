@@ -11,7 +11,7 @@ void* watch_thread_main(void* unused) {
 // separate from watch_thread_main because it uses a dynamic alloca() on each iteration
 bool do_watch() {
    struct pollfd *pollset;
-   struct timespec wake_time= { 0, 0 };
+   struct timespec wake_time= { 0, -1 };
    int capacity, buckets, n_poll, ofs, i, j, n, delay= 10000;
    char msgbuf[128];
    
@@ -56,35 +56,25 @@ bool do_watch() {
          pollset[ofs].events |= POLLIN;
       // If the socketalarm is in the process of being executed and stopped at
       // a 'sleep' command, factor that into the wake time.
-      j= alarm->cur_action;
-      if (j >= 0 && j < alarm->action_count) {
-         struct action *cur_action= alarm->actions+j;
-         if (cur_action->op == ACT_SLEEP) {
-            struct timespec *sleep_wake= &cur_action->act.slp.end_ts;
-            if ((wake_time.tv_sec == 0 && wake_time.tv_nsec == 0)
-             || wake_time.tv_sec > sleep_wake->tv_sec
-             || (wake_time.tv_sec == sleep_wake->tv_sec && wake_time.tv_nsec > sleep_wake->tv_nsec)
-            ) {
-               wake_time.tv_sec= sleep_wake->tv_sec;
-               wake_time.tv_nsec= sleep_wake->tv_nsec;
-               if (wake_time.tv_sec == 0 && wake_time.tv_nsec == 0) // make sure 0 isn't confused for unset
-                  wake_time.tv_nsec= 1;
-            }
+      if (alarm->wake_ts.tv_nsec != -1) {
+         if (wake_time.tv_nsec == -1
+          || wake_time.tv_sec > alarm->wake_ts.tv_sec
+          || (wake_time.tv_sec == alarm->wake_ts.tv_sec && wake_time.tv_nsec > alarm->wake_ts.tv_nsec)
+         ) {
+            wake_time.tv_sec= alarm->wake_ts.tv_sec;
+            wake_time.tv_nsec= alarm->wake_ts.tv_nsec;
          }
       }
    }
    pthread_mutex_unlock(&watch_list_mutex);
 
    // If there is a defined wake-time, truncate the delay if the wake-time comes first
-   if (wake_time.tv_sec != 0 || wake_time.tv_nsec != 0) {
-      struct timespec t;
-      if (clock_gettime(CLOCK_MONOTONIC, &t)) {
-         perror("clock_gettime(CLOCK_MONOTONIC)");
-      }
-      else {
+   if (wake_time.tv_nsec != -1) {
+      struct timespec now_ts= { 0, -1 };
+      if (lazy_build_now_ts(&now_ts)) {
          // subtract to find out delay. poll only has millisecond precision anyway.
-         int wake_delay= ((long)wake_time.tv_sec - (long)t.tv_sec) * 1000
-            + (wake_time.tv_nsec - t.tv_nsec)/1000000;
+         int wake_delay= ((long)wake_time.tv_sec - (long)now_ts.tv_sec) * 1000
+            + (wake_time.tv_nsec - now_ts.tv_nsec)/1000000;
          if (wake_delay < delay)
             delay= wake_delay;
       }
@@ -169,9 +159,12 @@ static bool watch_list_add(struct socketalarm *alarm) {
    }
 
    i= alarm->list_ofs;
-   if (i < 0) {
+   if (i < 0) { // only add if not already added
       alarm->list_ofs= watch_list_count;
       watch_list[watch_list_count++]= alarm;
+      // Initialize fields that watcher uses to track status
+      alarm->cur_action= -1;
+      alarm->wake_ts.tv_nsec= -1;
    }
    
    // If the thread is not running, start it.  Also create pipe if needed.

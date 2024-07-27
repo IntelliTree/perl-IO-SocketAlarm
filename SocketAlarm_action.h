@@ -47,6 +47,6 @@ struct action {
 };
 
 static bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *aux_buf, size_t *aux_len);
-static bool execute_action(struct action *act, bool resume, struct socketalarm *parent);
+static bool execute_action(struct action *act, bool resume, struct timespec *now_ts, struct socketalarm *parent);
 static const char *act_fd_variant_name(int variant);
 static int snprint_action(char *buffer, size_t buflen, struct action *act);

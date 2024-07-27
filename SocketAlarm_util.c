@@ -162,3 +162,16 @@ int snprint_fd_table(char *buf, size_t sizeof_buf, int max_fd) {
    }
    return len;
 }
+
+// This loads now_ts with the current clock time if it was not already initialized.
+// Use tv_nsec == -1 as an indicator of being uninitialized.
+bool lazy_build_now_ts(struct timespec *now_ts) {
+   if (now_ts->tv_nsec == -1) {
+      if (clock_gettime(CLOCK_MONOTONIC, now_ts) != 0) {
+         perror("clock_gettime(CLOCK_MONOTONIC)");
+         now_ts->tv_nsec= -1; // ensure remains undefined
+         return false; // kind of a serious error... but this runs from the background thread, so can't call 'croak'
+      }
+   }
+   return true;
+}

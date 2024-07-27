@@ -243,7 +243,7 @@ bool parse_actions(AV *spec, struct action *actions, size_t *n_actions, char *au
    return success;
 }
 
-bool execute_action(struct action *act, bool resume, struct socketalarm *parent) {
+bool execute_action(struct action *act, bool resume, struct timespec *now_ts, struct socketalarm *parent) {
    int low= act->op & 0xF;
    int high= act->op & ~0xF;
    int how;
@@ -255,23 +255,22 @@ bool execute_action(struct action *act, bool resume, struct socketalarm *parent)
          perror("kill");
       return true; // move to next action
    case ACT_SLEEP: {
-      struct timespec t;
-      if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) {
-         perror("clock_gettime(CLOCK_MONOTONIC)");
-         return true; // move to next action, can't continue this one.
-      }
+      lazy_build_now_ts(now_ts);
       // On initial entry to this action, use current time to calculate the wake time
       if (!resume) {
          double t_seconds;
-         t_seconds= (double) t.tv_sec + .000000001 * t.tv_nsec;
+         t_seconds= (double) now_ts->tv_sec + .000000001 * now_ts->tv_nsec;
          // Add seconds to this time
          t_seconds += act->act.slp.seconds;
-         act->act.slp.end_ts.tv_sec= (time_t) t_seconds;
-         act->act.slp.end_ts.tv_nsec= (t_seconds - (long) t_seconds) * 1000000000;
+         parent->wake_ts.tv_sec= (time_t) t_seconds;
+         parent->wake_ts.tv_nsec= (t_seconds - (long) t_seconds) * 1000000000;
+         if (!parent->wake_ts.tv_nsec)
+            parent->wake_ts.tv_nsec= 1; // because using tv_nsec as a defined-test
          return false; // come back later
       }
-      if (t.tv_sec > act->act.slp.end_ts.tv_sec
-         || (t.tv_sec == act->act.slp.end_ts.tv_sec && t.tv_nsec >= act->act.slp.end_ts.tv_nsec))
+      // Else see whether we have reached that time yet
+      if (now_ts->tv_sec > parent->wake_ts.tv_sec
+         || (now_ts->tv_sec == parent->wake_ts.tv_sec && now_ts->tv_nsec >= parent->wake_ts.tv_nsec))
          return true; // reached end_ts
       return false; // still waiting
    }

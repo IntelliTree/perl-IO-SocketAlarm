@@ -32,7 +32,8 @@ struct socketalarm {
    int watch_fd;
    int event_mask;
    int action_count;
-   int cur_action;   // used during execution
+   int cur_action;          // used during execution
+   struct timespec wake_ts; // used during execution
    HV *owner;
    struct action actions[];
 };
@@ -61,18 +62,18 @@ socketalarm_new(int watch_fd, int event_mask, AV *action_spec) {
    self->watch_fd= watch_fd;
    self->event_mask= event_mask;
    self->action_count= n_actions;
-   self->cur_action= -1;
-   self->list_ofs= -1;
+   self->list_ofs= -1; // initially not in the watch list
    self->owner= NULL;
    return self;
 }
 
 void socketalarm_exec_actions(struct socketalarm *sa) {
    bool resume= sa->cur_action >= 0;
+   struct timespec now_ts= { 0, -1 };
    if (!resume)
       sa->cur_action= 0;
    while (sa->cur_action < sa->action_count) {
-      if (!execute_action(sa->actions + sa->cur_action, resume, sa))
+      if (!execute_action(sa->actions + sa->cur_action, resume, &now_ts, sa))
          break;
       resume= false;
       ++sa->cur_action;
