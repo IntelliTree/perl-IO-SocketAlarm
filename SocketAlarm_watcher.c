@@ -3,8 +3,12 @@
 // Returns false when time to exit
 static bool do_watch();
 
-#define WATCHTHREAD_DEBUG(fmt, ...) (void) write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
-#define WATCHTHREAD_WARN(fmt, ...) (void) write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
+void watch_thread_log(void* buffer, int len) {
+   int unused= write(2, len <= 0? "error\n":buffer, len <= 0? 6 : len);
+   (void) unused;
+}
+#define WATCHTHREAD_DEBUG(fmt, ...) watch_thread_log(msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
+#define WATCHTHREAD_WARN(fmt, ...) watch_thread_log(msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
 
 void* watch_thread_main(void* unused) {
    while (do_watch()) {}
@@ -15,7 +19,7 @@ void* watch_thread_main(void* unused) {
 bool do_watch() {
    struct pollfd *pollset;
    struct timespec wake_time= { 0, -1 };
-   int capacity, buckets, sz, n_poll, ofs, i, j, n, delay= 10000;
+   int capacity, buckets, sz, n_poll, i, j, n, delay= 10000;
    char msgbuf[128];
    
    if (pthread_mutex_lock(&watch_list_mutex))
@@ -42,20 +46,6 @@ bool do_watch() {
       // Ignore watches that finished.  Main thread needs to clean these up.
       if (alarm->cur_action >= alarm->action_count)
          continue;
-      ofs= -1 + (int)pollfd_rbhash_insert(pollset+capacity, capacity, n_poll+1, fd & (buckets-1), fd);
-      if (ofs < 0) { // corrupt datastruct, should never happen
-         WATCHTHREAD_WARN("BUG: corrupt pollfd_rbhash");
-         break;
-      }
-      if (ofs == n_poll) { // using the new uninitialized one?
-         pollset[ofs].fd= fd;
-         pollset[ofs].events= 0;
-         ++n_poll;
-      }
-      // Add the poll flags of this socketalarm
-      int events= alarm->event_mask;
-      if (events & EVENT_EOF)
-         pollset[ofs].events |= POLLIN;
       // If the socketalarm is in the process of being executed and stopped at
       // a 'sleep' command, factor that into the wake time.
       if (alarm->wake_ts.tv_nsec != -1) {
@@ -65,6 +55,41 @@ bool do_watch() {
          ) {
             wake_time.tv_sec= alarm->wake_ts.tv_sec;
             wake_time.tv_nsec= alarm->wake_ts.tv_nsec;
+         }
+      }
+      else {
+         // Find a pollset slot for this file descriptor, collapsing duplicates.
+         // The next unused one is at [n_poll], which has NodeID n_poll+1
+         int poll_i= -1 + (int)pollfd_rbhash_insert(pollset+capacity, capacity, n_poll+1, fd & (buckets-1), fd);
+         if (poll_i < 0) { // corrupt datastruct, should never happen
+            WATCHTHREAD_WARN("BUG: corrupt pollfd_rbhash");
+            break;
+         }
+         if (poll_i == n_poll) { // using the new uninitialized one?
+            pollset[poll_i].fd= fd;
+            pollset[poll_i].events= 0;
+            ++n_poll;
+         }
+         // Add the poll flags of this socketalarm
+         int events= alarm->event_mask;
+         if (events & EVENT_SHUT) {
+            // On systems lacking POLLRDHUP, if a fd gets data in the queue, there is no way
+            // to wait exclusively for the EOF event.  We have to wake up periodically to
+            // check the socket.
+            #ifdef POLLRDHUP
+            pollset[poll_i].events= POLLRDHUP;
+            #else
+            if (action->unwaitable) // will be set if found data queued in the buffer
+               delay= 500;
+            else
+               pollset[poll_i].events= POLLIN;
+            #endif
+         }
+         if (events & EVENT_CLOSE) {
+            // According to poll docs, it is a bug to assume closing a socket in one thread
+            // will wake a 'poll' in another thread, so if the user wants to know about this
+            // condition, we have to loop more quickly.
+            delay= 500;
          }
       }
    }
@@ -87,14 +112,22 @@ bool do_watch() {
       return false;
    }
    for (i= 0; i < n_poll; i++) {
-      WATCHTHREAD_DEBUG("  fd=%3d revents=%02X\n", pollset[i].fd, pollset[i].revents);
+      int e= pollset[i].revents;
+      WATCHTHREAD_DEBUG("  fd=%3d revents=%02X (%s%s%s%s%s%s%s)\n", pollset[i].fd, e,
+         e&POLLIN? " IN":"", e&POLLPRI? " PRI":"", e&POLLOUT? " OUT":"",
+      #ifdef POLLRDHUP
+         e&POLLRDHUP? " RDHUP":"",
+      #else
+         "",
+      #endif
+         e&POLLERR? " ERR":"", e&POLLHUP? " HUP":"", e&POLLNVAL? " NVAL":"");
    }
    
    // First, did we get new control messages?
    if (pollset[0].revents & POLLIN) {
       char msg;
-      if (read(pollset[0].fd, &msg, 1) != 1) { // should never fail
-         WATCHTHREAD_DEBUG("read != 1\n");
+      if (recv(pollset[0].fd, &msg, 1, MSG_DONTWAIT) != 1) { // should never fail
+         WATCHTHREAD_DEBUG("read(control_ppipe) != 1, terminating watch_thread\n");
          return false;
       }
       if (msg == CONTROL_TERMINATE) {// intentional exit
@@ -111,30 +144,69 @@ bool do_watch() {
       abort(); // should never fail
    for (i= 0, n= watch_list_count; i < n; i++) {
       struct socketalarm *alarm= watch_list[i];
-      int fd= alarm->watch_fd, poll_idx;
-      if (alarm->cur_action >= alarm->action_count) // stale alarm left in list
-         continue;
-
-      poll_idx= -1 + (int)pollfd_rbhash_find(pollset+capacity, capacity, fd & (buckets-1), fd);
-      if (poll_idx < 0) // can only happen if watch_list changed while we let go of the mutex (or a bug in rbhash)
-         continue;
-
       // If it has not been triggered yet, see if it is now
       if (alarm->cur_action == -1) {
          bool trigger= false;
-         int events= alarm->event_mask;
-         if (events & EVENT_EOF) {
-            if (pollset[poll_idx].revents & POLLHUP)
+         int fd= alarm->watch_fd, revents;
+         size_t pollfd_node;
+         struct stat statbuf;
+         // Is it still the same socket that we intended to watch?
+         if (fstat(fd, &statbuf) != 0
+            || statbuf.st_dev != alarm->watch_fd_dev
+            || statbuf.st_ino != alarm->watch_fd_ino
+         ) {
+            // fd was closed/reused.  If user watching event CLOSE, then trigger the actions,
+            // else assume that the host program took care of the socket and doesn't want
+            // the alarm.
+            if (alarm->event_mask & EVENT_CLOSE)
                trigger= true;
-            else if (pollset[poll_idx].revents & POLLIN)
-               trigger= true;
-            //}
+            else
+               alarm->cur_action= alarm->action_count;
          }
-         if (trigger)
-            socketalarm_exec_actions(alarm);
+         // Are we fast-looping to check for an un-waitable condition?
+         else if (alarm->unwaitable) {
+            // This happens when POLLRDHUP is not available and there is data in the recv buffer of the
+            //   socket, preventing us from using POLLIN.
+            // I think only OpenBSD is affected by this, and I can't find any other API they provide that
+            //   would indicate if the socket is in CLOSE_WAIT state.
+            // Just check the socket again and see if the data got removed from the input buffer...
+            int avail= recv(fd, msgbuf, sizeof(msgbuf), MSG_DONTWAIT|MSG_PEEK);
+            if (avail == 0)
+               trigger= true;
+            else if (avail < 0)
+               alarm->unwaitable= false;
+            // else just keep checking...
+         }
+         else {
+            int poll_i= -1 + (int) pollfd_rbhash_find(pollset+capacity, capacity, fd & (buckets-1), fd);
+            // Did we poll this fd?
+            if (poll_i < 0)
+               // can only happen if watch_list changed while we let go of the mutex (or a bug in rbhash)
+               continue;
+
+            revents= pollset[poll_i].revents;
+            if (alarm->event_mask & EVENT_SHUT)
+            #ifdef POLLRDHUP
+               trigger= trigger || (revents & (POLLHUP|POLLRDHUP|POLLERR));
+            #else
+            {
+               trigger= trigger || (revents & (POLLHUP|POLLERR));
+               if (!trigger) {
+                  int avail= recv(fd, msgbuf, sizeof(msgbuf), MSG_DONTWAIT|MSG_PEEK);
+                  if (avail == 0) // EOF indication
+                     trigger= true;
+                  else if (avail > 0)
+                     // there is data on the socket, so can't detect a 0-length read, and need to
+                     // use ioctl to check for shutdown
+                     action->unwaitable= true;
+               }
+            }
+            #endif
+         }
+         if (!trigger)
+            continue;
       }
-      else
-         socketalarm_exec_actions(alarm);
+      socketalarm_exec_actions(alarm);
    }
    pthread_mutex_unlock(&watch_list_mutex);
    return true;

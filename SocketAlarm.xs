@@ -24,17 +24,20 @@ struct socketalarm;
 #include "pollfd_rbhash.h"
 #include "SocketAlarm_watcher.h"
 
-#define EVENT_EOF    0x01
-#define EVENT_EPIPE  0x02
+#define EVENT_SHUT      0x01
+#define EVENT_CLOSE     0x02
 
 struct socketalarm {
-   int list_ofs;     // position within action_list, initially -1 until activated
+   int list_ofs;      // position within watch_list, initially -1 until activated
    int watch_fd;
+   dev_t watch_fd_dev;
+   ino_t watch_fd_ino;
    int event_mask;
    int action_count;
-   int cur_action;          // used during execution
-   struct timespec wake_ts; // used during execution
    SV *owner;
+   bool unwaitable;         //
+   int cur_action;          // used during execution
+   struct timespec wake_ts; //
    struct action actions[];
 };
 
@@ -45,7 +48,7 @@ static void socketalarm_exec_actions(struct socketalarm *sa);
 #include "SocketAlarm_watcher.c"
 
 struct socketalarm *
-socketalarm_new(int watch_fd, int event_mask, SV **action_spec, size_t spec_count) {
+socketalarm_new(int watch_fd, struct stat *statbuf, int event_mask, SV **action_spec, size_t spec_count) {
    size_t n_actions= 0, aux_len= 0, len_before_aux;
    struct socketalarm *self= NULL;
 
@@ -60,6 +63,8 @@ socketalarm_new(int watch_fd, int event_mask, SV **action_spec, size_t spec_coun
    if (!parse_actions(action_spec, spec_count, self->actions, &n_actions, ((char*)self) + len_before_aux, &aux_len))
       croak("BUG: buffers not large enough for parse_actions");
    self->watch_fd= watch_fd;
+   self->watch_fd_dev= statbuf->st_dev;
+   self->watch_fd_ino= statbuf->st_ino;
    self->event_mask= event_mask;
    self->action_count= n_actions;
    self->list_ofs= -1; // initially not in the watch list
@@ -198,7 +203,7 @@ _init_socketalarm(self, sock_sv, eventmask_sv, actions_sv)
    SV *actions_sv
    INIT:
       int sock_fd= fileno_from_sv(sock_sv);
-      int eventmask= EVENT_EOF | EVENT_EPIPE;
+      int eventmask= EVENT_SHUT;
       struct stat statbuf;
       struct socketalarm *sa;
       SV **action_list= NULL;
@@ -220,7 +225,7 @@ _init_socketalarm(self, sock_sv, eventmask_sv, actions_sv)
          n_actions= av_count(actions);
          action_list= AvARRAY(actions);
       }
-      sa= socketalarm_new(sock_fd, eventmask, action_list, n_actions);
+      sa= socketalarm_new(sock_fd, &statbuf, eventmask, action_list, n_actions);
       attach_magic_socketalarm(SvRV(self), sa);
       XSRETURN(1); // return $self
 
@@ -249,8 +254,8 @@ stringify(alarm)
    CODE:
       sv_catpvf(out, "watch fd: %d\n", alarm->watch_fd);
       sv_catpvf(out, "event mask:%s%s\n",
-         alarm->event_mask & EVENT_EOF? " EOF":"",
-         alarm->event_mask & EVENT_EPIPE? " EPIPE":""
+         alarm->event_mask & EVENT_SHUT? " SHUT":"",
+         alarm->event_mask & EVENT_CLOSE? " CLOSE":""
       );
       sv_catpv(out, "actions:\n");
       for (i= 0; i < alarm->action_count; i++) {
@@ -275,7 +280,7 @@ socketalarm(sock_sv, ...)
    SV *sock_sv
    INIT:
       int sock_fd= fileno_from_sv(sock_sv);
-      int eventmask= EVENT_EOF|EVENT_EPIPE;
+      int eventmask= EVENT_SHUT;
       int action_ofs= 1;
       struct stat statbuf;
    CODE:
@@ -288,7 +293,7 @@ socketalarm(sock_sv, ...)
             action_ofs++;
          }
       }
-      RETVAL= socketalarm_new(sock_fd, eventmask, &(ST(action_ofs)), items - action_ofs);
+      RETVAL= socketalarm_new(sock_fd, &statbuf, eventmask, &(ST(action_ofs)), items - action_ofs);
       watch_list_add(RETVAL);
    OUTPUT:
       RETVAL
@@ -323,13 +328,39 @@ get_fd_table_str(max_fd=1024)
    OUTPUT:
       RETVAL
 
+# For unit test purposes only, export _poll that polls on a single file
+# descriptor to verify the statuses for sockets in various states.
+
+void
+_poll(fd, events, timeout)
+   int fd
+   SV *events;
+   int timeout;
+   INIT:
+      struct pollfd pollbuf;
+   PPCODE:
+      pollbuf.fd= fd;
+      pollbuf.events= SvIV(events);
+      EXTEND(SP, 2);
+      PUSHs(sv_2mortal(newSViv(poll(&pollbuf, 1, timeout))));
+      PUSHs(sv_2mortal(newSViv(pollbuf.revents)));
+
 #-----------------------------------------------------------------------------
 #  Constants
 #
 
 BOOT:
    HV* stash= gv_stashpvn("IO::SocketAlarm::Util", 21, 1);
-   EXPORT_ENUM(EVENT_EOF);
-   EXPORT_ENUM(EVENT_EPIPE);
+   EXPORT_ENUM(EVENT_SHUT);
+   EXPORT_ENUM(EVENT_CLOSE);
+   EXPORT_ENUM(POLLIN);
+   EXPORT_ENUM(POLLOUT);
+   EXPORT_ENUM(POLLPRI);
+   EXPORT_ENUM(POLLERR);
+   EXPORT_ENUM(POLLHUP);
+   EXPORT_ENUM(POLLNVAL);
+   #ifdef POLLRDHUP
+   EXPORT_ENUM(POLLRDHUP);
+   #endif
 
 PROTOTYPES: DISABLE

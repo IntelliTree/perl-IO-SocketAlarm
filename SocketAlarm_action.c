@@ -352,10 +352,11 @@ bool execute_action(struct action *act, bool resume, struct timespec *now_ts, st
       perror("exec"); // if we got here, it failed.  Log the error.
       _exit(1); // make sure we don't continue this process.
    }
-   default:
-      write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), "No such action code %d", act->op));
+   default: {
+      int unused= write(2, msgbuf, snprintf(msgbuf, sizeof(msgbuf), "BUG: No such action code %d", act->op));
+      (void) unused;
       return true; // pretend success; false would cause it to come back to this action later
-   }
+   }}
 }
 
 const char *act_fd_variant_name(int variant) {
