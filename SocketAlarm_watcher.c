@@ -126,8 +126,9 @@ bool do_watch() {
    // First, did we get new control messages?
    if (pollset[0].revents & POLLIN) {
       char msg;
-      if (recv(pollset[0].fd, &msg, 1, MSG_DONTWAIT) != 1) { // should never fail
-         WATCHTHREAD_DEBUG("read(control_ppipe) != 1, terminating watch_thread\n");
+      int ret= read(pollset[0].fd, &msg, 1);
+      if (ret != 1) { // should never fail
+         WATCHTHREAD_DEBUG("read(control_pipe): %d, errno %m, terminating watch_thread\n", ret);
          return false;
       }
       if (msg == CONTROL_TERMINATE) {// intentional exit
@@ -248,6 +249,7 @@ static bool watch_list_add(struct socketalarm *alarm) {
       // Initialize fields that watcher uses to track status
       alarm->cur_action= -1;
       alarm->wake_ts.tv_nsec= -1;
+      alarm->unwaitable= false;
    }
    
    // If the thread is not running, start it.  Also create pipe if needed.
