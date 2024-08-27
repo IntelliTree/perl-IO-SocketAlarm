@@ -362,10 +362,53 @@ bool execute_action(struct action *act, bool resume, struct timespec *now_ts, st
 const char *act_fd_variant_name(int variant) {
    switch (variant) {
    case ACT_x_CLOSE: return "close";
+   case ACT_x_SHUT_R: return "shut_r";
+   case ACT_x_SHUT_W: return "shut_w";
+   case ACT_x_SHUT_RW: return "shut_rw";
+   default: return "BUG";
+   }
+}
+
+const char *act_fd_variant_description(int variant) {
+   switch (variant) {
+   case ACT_x_CLOSE: return "close";
    case ACT_x_SHUT_R: return "shutdown SHUT_RD";
    case ACT_x_SHUT_W: return "shutdown SHUT_WR";
    case ACT_x_SHUT_RW: return "shutdown SHUT_RDWR";
    default: return "BUG";
+   }
+}
+
+static void inflate_action(struct action *act, AV *dest) {
+   int low= act->op & 0xF;
+   int high= act->op & ~0xF;
+   int i;
+   switch (high) {
+   case ACT_KILL:  av_extend(dest, 2);
+      av_push(dest, newSVpvs("kill"));
+      av_push(dest, newSViv(act->act.kill.signal));
+      av_push(dest, newSViv(act->act.kill.pid));
+      return;
+   case ACT_SLEEP: av_extend(dest, 1);
+      av_push(dest, newSVpvs("sleep"));
+      av_push(dest, newSVnv(act->act.slp.seconds));
+      return;
+   //case ACT_JUMP:  return snprintf(buffer, buflen, "goto %d", (int)act->act.jmp.idx);
+   case ACT_FD_x:  av_extend(dest, 1);
+      av_push(dest, newSVpv(act_fd_variant_name(low), 0));
+      av_push(dest, newSViv(act->act.fd.fd));
+      return;
+   case ACT_PNAME_x: av_extend(dest, 1);
+      av_push(dest, newSVpv(act_fd_variant_name(low), 0));
+      av_push(dest, newSVpvn((char*)act->act.nam.addr, act->act.nam.addr_len));
+      return;
+   case ACT_EXEC: av_extend(dest, act->act.run.argc);
+      av_push(dest, newSVpv(act->op == ACT_RUN? "run":"exec", 0));
+      for (i= 0; i < act->act.run.argc; i++)
+         av_push(dest, newSVpv(act->act.run.argv[i], 0));
+      return;
+   default:
+      croak("BUG: action code %d", act->op);
    }
 }
 
@@ -376,11 +419,11 @@ int snprint_action(char *buffer, size_t buflen, struct action *act) {
    case ACT_KILL:  return snprintf(buffer, buflen, "kill sig=%d pid=%d", (int)act->act.kill.signal, (int) act->act.kill.pid);
    case ACT_SLEEP: return snprintf(buffer, buflen, "sleep %.3lfs", (double)act->act.slp.seconds);
    //case ACT_JUMP:  return snprintf(buffer, buflen, "goto %d", (int)act->act.jmp.idx);
-   case ACT_FD_x:  return snprintf(buffer, buflen, "%s %d", act_fd_variant_name(low), act->act.fd.fd);
+   case ACT_FD_x:  return snprintf(buffer, buflen, "%s %d", act_fd_variant_description(low), act->act.fd.fd);
    case ACT_PNAME_x:
    case ACT_SNAME_x: {
       int pos= snprintf(buffer, buflen, "%s %s ",
-         act_fd_variant_name(low),
+         act_fd_variant_description(low),
          high == ACT_PNAME_x? "peername":"sockname"
       );
       return pos + snprint_sockaddr(buffer+pos, buflen > pos? buflen-pos : 0, act->act.nam.addr);

@@ -49,3 +49,4 @@ static bool parse_actions(SV **spec, int n_spec, struct action *actions, size_t 
 static bool execute_action(struct action *act, bool resume, struct timespec *now_ts, struct socketalarm *parent);
 static const char *act_fd_variant_name(int variant);
 static int snprint_action(char *buffer, size_t buflen, struct action *act);
+static void inflate_action(struct action *act, AV *dest);

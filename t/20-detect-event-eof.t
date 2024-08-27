@@ -44,9 +44,12 @@ is( collect_alarms($s1,$s2), ['ontime'], 'TCP alarms' );
 
    sleep .1;
    $SIG{ALRM}= sub { note "Got alarm"; push @got_alarm, 'ontime' };
+   ok( !$seq[-1]->triggered, 'not triggered yet' ) or note "cur_action = ".$seq[-1]->cur_action;
    # shutdown the final socket, triggering a chain reaction of shutdowns, and finally the signal
    shutdown($seq[-3], SHUT_WR);
    sleep 10; # sleep will get interrupted
+   ok( $seq[-1]->triggered, 'triggered' );
+   ok( $seq[-1]->finished, 'finished' );
    is( \@got_alarm, ['ontime'], 'cascade ending with alarm' );
 }
 

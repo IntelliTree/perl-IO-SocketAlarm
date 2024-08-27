@@ -7,8 +7,13 @@ void watch_thread_log(void* buffer, int len) {
    int unused= write(2, len <= 0? "error\n":buffer, len <= 0? 6 : len);
    (void) unused;
 }
+#ifdef WATCHTHREAD_DEBUGGING
 #define WATCHTHREAD_DEBUG(fmt, ...) watch_thread_log(msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
 #define WATCHTHREAD_WARN(fmt, ...) watch_thread_log(msgbuf, snprintf(msgbuf, sizeof(msgbuf), fmt, ##__VA_ARGS__ ))
+#else
+#define WATCHTHREAD_DEBUG(fmt, ...) ((void)0)
+#define WATCHTHREAD_WARN(fmt, ...) ((void)0)
+#endif
 
 void* watch_thread_main(void* unused) {
    while (do_watch()) {}
@@ -72,19 +77,22 @@ bool do_watch() {
          }
          // Add the poll flags of this socketalarm
          int events= alarm->event_mask;
-         if (events & EVENT_SHUT) {
-            // On systems lacking POLLRDHUP, if a fd gets data in the queue, there is no way
-            // to wait exclusively for the EOF event.  We have to wake up periodically to
-            // check the socket.
-            #ifdef POLLRDHUP
+         #ifdef POLLRDHUP
+         if (events & EVENT_SHUT)
             pollset[poll_i].events= POLLRDHUP;
-            #else
-            if (action->unwaitable) // will be set if found data queued in the buffer
+         #endif
+         if (events & EVENT_EOF) {
+            // If a fd gets data in the queue, there is no way to wait exclusively
+            // for the EOF event.  We have to wake up periodically to check the socket.
+            if (alarm->unwaitable) // will be set if found data queued in the buffer
                delay= 500;
             else
                pollset[poll_i].events= POLLIN;
-            #endif
          }
+         if (events & EVENT_IN)
+            pollset[poll_i].events= POLLIN;
+         if (events & EVENT_PRI)
+            pollset[poll_i].events= POLLPRI;
          if (events & EVENT_CLOSE) {
             // According to poll docs, it is a bug to assume closing a socket in one thread
             // will wake a 'poll' in another thread, so if the user wants to know about this
@@ -164,20 +172,6 @@ bool do_watch() {
             else
                alarm->cur_action= alarm->action_count;
          }
-         // Are we fast-looping to check for an un-waitable condition?
-         else if (alarm->unwaitable) {
-            // This happens when POLLRDHUP is not available and there is data in the recv buffer of the
-            //   socket, preventing us from using POLLIN.
-            // I think only OpenBSD is affected by this, and I can't find any other API they provide that
-            //   would indicate if the socket is in CLOSE_WAIT state.
-            // Just check the socket again and see if the data got removed from the input buffer...
-            int avail= recv(fd, msgbuf, sizeof(msgbuf), MSG_DONTWAIT|MSG_PEEK);
-            if (avail == 0)
-               trigger= true;
-            else if (avail < 0)
-               alarm->unwaitable= false;
-            // else just keep checking...
-         }
          else {
             int poll_i= -1 + (int) pollfd_rbhash_find(pollset+capacity, capacity, fd & (buckets-1), fd);
             // Did we poll this fd?
@@ -186,26 +180,41 @@ bool do_watch() {
                continue;
 
             revents= pollset[poll_i].revents;
-            if (alarm->event_mask & EVENT_SHUT)
+            trigger= ((alarm->event_mask & EVENT_SHUT) && (revents &
             #ifdef POLLRDHUP
-               trigger= trigger || (revents & (POLLHUP|POLLRDHUP|POLLERR));
+                        (POLLHUP|POLLRDHUP|POLLERR)
             #else
-            {
-               trigger= trigger || (revents & (POLLHUP|POLLERR));
-               if (!trigger) {
-                  int avail= recv(fd, msgbuf, sizeof(msgbuf), MSG_DONTWAIT|MSG_PEEK);
-                  if (avail == 0) // EOF indication
-                     trigger= true;
-                  else if (avail > 0)
-                     // there is data on the socket, so can't detect a 0-length read, and need to
-                     // use ioctl to check for shutdown
-                     action->unwaitable= true;
+                        (POLLHUP|POLLERR)
+            #endif
+                     ))
+                  || ((alarm->event_mask & EVENT_IN) && (revents & POLLIN))
+                  || ((alarm->event_mask & EVENT_PRI) && (revents & POLLPRI));
+            // Now the tricky one, EVENT_EOF...
+            if (!trigger && (alarm->event_mask & EVENT_EOF) && (alarm->unwaitable || (revents & POLLIN))) {
+               int avail= recv(fd, msgbuf, sizeof(msgbuf), MSG_DONTWAIT|MSG_PEEK);
+               if (avail == 0)
+                  // This the zero-length read that means EOF
+                  trigger= true;
+               else
+                  // else if there is data on the socket, we are in the "unwaitable" condition
+                  // else, error conditions are not "EOF" and can still be waited using POLLIN.
+                  alarm->unwaitable= (avail > 0);
+            }
+            // We're playing with race conditions, so make sure one more time that we're
+            // triggering on the socket we expected.
+            if (trigger) {
+               if ((fstat(fd, &statbuf) != 0
+                  || statbuf.st_dev != alarm->watch_fd_dev
+                  || statbuf.st_ino != alarm->watch_fd_ino
+                  ) && !(alarm->event_mask & EVENT_CLOSE)
+               ) {
+                  alarm->cur_action= alarm->action_count;
+                  trigger= false;
                }
             }
-            #endif
          }
          if (!trigger)
-            continue;
+            continue; // don't exec_actions
       }
       socketalarm_exec_actions(alarm);
    }
@@ -272,6 +281,16 @@ static bool watch_list_add(struct socketalarm *alarm) {
    }
    pthread_mutex_unlock(&watch_list_mutex);
    return i < 0;
+}
+
+// need to lock mutex before accessing concurrent alarm fields
+static void watch_list_item_get_status(struct socketalarm *alarm, int *cur_action_out) {
+   if (pthread_mutex_lock(&watch_list_mutex))
+      croak("mutex_lock failed");
+
+   if (cur_action_out) *cur_action_out= alarm->cur_action;
+
+   pthread_mutex_unlock(&watch_list_mutex);
 }
 
 // May only be called by Perl's thread

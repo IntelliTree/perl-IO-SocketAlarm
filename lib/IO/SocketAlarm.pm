@@ -11,10 +11,10 @@ require XSLoader;
 XSLoader::load('IO::SocketAlarm', $IO::SocketAlarm::VERSION);
 
 # All exports are part of the Util sub-package.
-# They are declared in XS
 package IO::SocketAlarm::Util {
    our @EXPORT_OK= qw( socketalarm get_fd_table_str is_socket );
    use Exporter 'import';
+   # Declared in XS
 }
 
 sub import {
@@ -34,10 +34,9 @@ sub import {
   $alarm->cancel;  # stop receiving signal
   
   # More extreme example: when client goes away, terminate
-  # the current process and also kill the mysql query.
+  # the current worker process and also kill the mysql query.
   my $mysql_conn_id= $dbh->selectcoll_arrayref("SELECT CONNECTION_ID()")->[0];
-  my $alarm= socketalarm($socket, EVENT_EOF|EVENT_EPIPE,
-    [ exec => 'mysql', -e => "kill $mysql_conn_id" ]);
+  my $alarm= socketalarm($socket, [ exec => 'mysql', -e => "kill $mysql_conn_id" ]);
 
 =head1 DESCRIPTION
 
@@ -45,26 +44,34 @@ Sometimes you have a blocking system call, or blocking library, and it prevents 
 checking whether the initiator of this request (like a http client) is still waiting for the
 answer.  The right way to solve the problem is an event loop, where you are waiting both for
 the long-tunning task and also watching for events on the client connection and your program
-can respond to either of them.  But, if you don't have the luxury of refactoring your whole
-project to be event-driven, and you'd really just like a way to kill the current script when
-the client is lost and you're blocking in a long-running database call, this module is for
-you.
+can respond to either of them.  Perl has several great event loops, like L<Mojo::IOLoop>,
+L<AnyEvent>, or L<IO::Async> with which you can build a properly engineered solution.
+But... if you don't have the luxury of refactoring your whole project to be event-driven, and
+you'd really just like a way to kill the current HTTP worker when the client is lost and you're
+blocking in a long-running database call, this module is for you.
 
-This module oeprates by creating a second C-level thread, regardless of whether your perl
-was compiled with threading support.  While the module is thread-safe, per-se, it does
-introduce the sorts of confusion caused by concurrency, like checking C<< $watch->pending >>
-and having that status change before the very next line of code you run.
+This module operates by creating a second C-level thread (regardless of whether your perl was
+compiled with threading support) and having that thread monitor the status of your socket.
 
-The background thread also limits the types of actions you can take.  For example, you
-definitely can't run perl code in response to the status change.  This module tries to provide
-a useful toolkit of actions, including forking off a command.
+B<First caveat:> The background thread is limited in the types of actions it can take.
+For example, you definitely can't run perl code in response to the status change, but it can
+send a signal to the main thread, or other process-global actions like completely exiting and
+executing C<< mysql -e "kill $conn_id" >>.
 
-Also beware that the signals you send to yourself won't take effect until control returns to
-the perl interpreter, so if you are blocking in a C library, it might be that the only way to
-wake it up is to close the file handles it is using.  For mysql, this can be extremely
-problematic if it is using mysql_auto_reconnect, and besides which, mysql servers don't notice
-that clients are gone until the current query ends.  Stopping a long-running mysql query can
-mostly only be accomplished from the server side.
+B<Second caveat:> This module's design isn't 100% portable beyond Linux and FreeBSD. On Windows,
+MacOS, and OpenBSD there is no way (that I've found) to poll for TCP 'FIN' status.  This module
+will probably still work for a HTTP worker behind a reverse proxy; see L</EVENT_EOF> below.
+
+B<Third caveat:> While the module is thread-safe, per-se, it does introduce the sorts of
+confusion caused by concurrency, like checking C<< $alarm->triggered >> and having that status
+change before the very next line of code in your script.
+
+B<Fourth caveat:> The signals you send to yourself won't take effect until control returns to
+the perl interpreter.  If you are blocking in a C library or XS, it might be that the only
+way to wake it up is to close the file handles it is using.  For DBD::mysql and libmysql, that
+doesn't even work because of mysql_auto_reconnect, and besides which, mysql servers don't
+notice that clients are gone until the current query ends.  Stopping a long-running mysql query
+can (seemingly) only be accomplished by running SQL on the server.
 
 =head1 EXPORTS
 
@@ -72,7 +79,7 @@ This module exports everything from L<IO::SocketAlarm::Util>.  Of particular not
 
 =head2 socketalarm
 
-  $alarm= socketalarm($socket); # sends SIGALRM when EVENT_EOF|EVENT_EPIPE
+  $alarm= socketalarm($socket); # sends SIGALRM when EVENT_SHUT
   $alarm= socketalarm($socket, @actions);
   $alarm= socketalarm($socket, $event_mask, @actions);
 
@@ -118,36 +125,58 @@ Perl virtual handle of some sort), and still be open.
 
 This is a bit-mask of which events to trigger on.  Combine them with the bitwise-or operator:
 
-  # the default:
-  events => EVENT_EOF|EVENT_EPIPE,
+  # the default on Linux/FreeBSD:
+  events => EVENT_SHUT,
+  # the default on Windows/Mac/OpenBSD
+  events => EVENT_SHUT|EVENT_EOF,
 
 =over
 
+=item EVENT_SHUT
+
+Triggers when the TCP connection is being shutdown (the TCP "FIN" flag) or any detectable
+condition that means communication on the socket is no longer possible and is the result of an
+external event.
+
+While this event is the whole point of this module, there actually isn't a good cross-platform
+way to identify this condition!  Linux and FreeBSD provide a reliable POLLRDHUP flag to poll()
+to get notified of the TCP 'FIN' flag, but on OpenBSD and Mac and Windows the best you can do
+is check for a zero-length "peek" on the socket, which only works if the application has already
+read all incoming data on the socket.  (but this works for typical HTTP worker pools where only
+one request will be sent from the reverse proxy to the worker, before closing the connection)
+
+The poll() POLLHUP flag also triggers this event, for socket types (or pipes) that emit this
+flag in a useful manner.
+
 =item EVENT_EOF
 
-Triggers when the peer has closed the connection, or shut down writing from their end.
-(there may still be data available to be read from the socket's buffer)
+Triggers when the file handle indicates EOF by a successful zero-length read.  This is checked
+by performing a C<< recv(sock, buf, len, MSG_PEEK|MSG_DONTWAIT) >> so that no actual data is
+removed from the socket.  If your peer writes data to the socket before closing it, you won't
+get this event until you read that data.  There is no efficient way to wait for this event when
+the peer has sent additional data; this module falls back to checking at short intervals in that
+case, which is inefficient and may fail to deliver the event when you need it delivered.
 
-=item EVENT_EPIPE
+But again, this generally works in a HTTP worker pool where this module is intended to be used.
 
-Triggers when writing the socket would generate an EPIPE signal.
+=item EVENT_IN
+
+Triggers if there is any data available to be read from the socket.  This sets the POLLIN flag
+on the call to poll().
+
+=item EVENT_PRI
+
+Triggers if there is any priority data available to be read from the socket.  This sets the
+POLLPRI flag on the call to poll().
 
 =item EVENT_CLOSE
 
-Triggers when the status of C<is_socket($fd)> changes to false.  Due to the asynchronous nature
-of this module, a file descriptor could get recycled with a new socket before this module sees
-it as closed.  To detect that case, you probably also want EVENT_RENAME.
+Triggers when another thread on this application has called "close" on the socket file handle.
+More specifically, it triggers when "stat()" fails or reports a different device or inode for
+the file descriptor, indicating that descriptor number has been closed or recycled.
 
-(it is a better idea to make sure you cancel the watch before returning to any code which might
+(it is a better idea to make sure you cancel the alarm before returning to any code which might
  close your end of the socket)
-
-=item EVENT_RENAME
-
-Every connected socket has a bound address, retrievable with C<getsockname>.  If this module
-sees that a socket's name has changed, it assumes a race condition where the socket was closed
-and the FD recycled for a new connection.  So, normally this event causes the alarm to cancel
-itself, but if you want it to trigger instead, then include this bit in the events.  But, it is
-also possible you called C<bind> on the socket to set a new name...
 
 =back
 
@@ -180,7 +209,9 @@ but the opposite of the C library, and a mixup can be bad!
 
 =item close
 
-  [ close => $fd_or_sockname, ... ],
+  [ close => 5, ... ]
+  [ close => $fh, ... ]
+  [ close => pack_sockaddr_in($port, inet_aton("localhost")), ... ]
 
 Close one or more file descriptors or socket names.  This could have uses like killing database
 connections when you know the file handle number or host:port of the database server.
@@ -188,8 +219,8 @@ connections when you know the file handle number or host:port of the database se
 If the parameter is an integer, it is assumed to be a raw file descriptor number like you get
 from C<fileno>.  If the parameter is an IO::Handle, it calls C<fileno> for you, and croaks if
 that handle isn't backed by a real file descriptor.  The parameter can also be a byte string
-as per the C<getpeername> function; in this case B<all> sockets connected to that peer name will
-be closed.
+as per the C<getpeername> or C<pack_sockaddr_in> functions; in this case B<all> sockets
+connected to that peer name will be closed.
 
 =item shut_r, shut_w, shut_rw
 
@@ -198,9 +229,9 @@ be closed.
   [ shut_rw => $fd_or_sockname, ... ],
 
 Like C<close>, but instead of calling C<close(fd)> it calls the socket function
-C<< shutdown(fd, $how) >> where C<$how> is one of SHUT_RD, SHUT_RW, SHUT_RDWR.  This leaves the
-socket open, but causes reads or writes to fail, which may give a more graceful cancellation of
-whatever was happening over that socket.
+C<< shutdown(fd, $how) >> where C<$how> is one of C<SHUT_RD>, C<SHUT_RW>, C<SHUT_RDWR>.
+This leaves the socket open, but causes reads or writes to fail, which may give a more graceful
+cancellation of whatever was happening over that socket.
 
 =item run
 
@@ -211,7 +242,7 @@ connected to /dev/null on STDIN.  The double-fork (and reap of first forked chil
 (grand)child process to run independently from the current process, and get reaped by C<init>,
 and not tangle up whatever you might be doing with C<waitpid>.  If the C<exec> fails, it is
 reported on C<STDERR>, but the current process has no way to inspect the outcome of the C<exec>
-or the status of the program.
+or the exit status of the program it runs.
 
 =item exec
 
@@ -231,9 +262,24 @@ Wait before running the next action.
 
 =back
 
+=head3 cur_action
+
+Returns -1 if the alarm is not yet triggered, else the number of the action being executed,
+ending with the integer beyond the max element of L</actions>.  Note that by the time your
+script reads this attribute, it may already have changed.
+
 =head3 triggered
 
-Whether or not 
+Shortcut for C<< $cur_action == -1 >>
+
+=head3 finished
+
+Shortcut for C<< $cur_action > $#actions >>
+
+=cut
+
+sub triggered { $_[0]->cur_action >= 0 }
+sub finished { $_[0]->cur_action >= $_[0]->action_count }
 
 =head2 Methods
 
