@@ -20,6 +20,7 @@ This is a shortcut for L<IO::SocketAlarm-E<gt>new|IO::SocketAlarm/new>:
     events => $event_mask,
     actions => \@actions,
   );
+  $alarm->start;
 
 =head2 is_socket
 
