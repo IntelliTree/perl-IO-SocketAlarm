@@ -268,6 +268,10 @@ Returns -1 if the alarm is not yet triggered, else the number of the action bein
 ending with the integer beyond the max element of L</actions>.  Note that by the time your
 script reads this attribute, it may already have changed.
 
+=head2 action_count
+
+Shortcut for C<< scalar @{actions} >>, but avoids inflating the arrayref of actions.
+
 =head3 triggered
 
 Shortcut for C<< $cur_action == -1 >>
@@ -292,6 +296,10 @@ prior to this call. (i.e. whether the call changed the state of the alarm)
 
 Stop listening for the alarm events.  Returns a boolean of whether the alarm was active prior
 to this call.  (i.e. whether the call changed the state of the alarm)
+
+=head3 stringify
+
+Render the alarm as user-readable text, for diagnosis and logging.
 
 =cut
 

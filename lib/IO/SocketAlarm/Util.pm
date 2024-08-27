@@ -37,3 +37,19 @@ descriptor) It permits file handles or file descriptor numbers.
 Return a human-readable string describing each open file descriptor.  This is just for
 debugging, and relies on /proc/self/fd/ symlinks for anything other than sockets.
 For sockets, it prints the bound name and peer name of the socket.
+
+=head2 Event Constants
+
+=over
+
+=item EVENT_SHUT
+
+=item EVENT_EOF
+
+=item EVENT_IN
+
+=item EVENT_PRI
+
+=item EVENT_CLOSE
+
+=back
