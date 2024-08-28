@@ -3,16 +3,22 @@
 #include "XSUB.h"
 #include "ppport.h"
 
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <signal.h>
-#include <stdlib.h>
-#include <sys/types.h>
 #include <poll.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
 
 #define AUTOCREATE 1
 #define OR_DIE 2
@@ -133,10 +139,10 @@ void socketalarm_free(struct socketalarm *sa) {
 /* Return an SV array of an AV.
  * Returns NULL if it wasn't an AV or arrayref.
  */
-static SV** unwrap_array(SV *array, ssize_t *len_out) {
+static SV** unwrap_array(SV *array, SSize_t *len_out) {
    AV *av;
    SV **vec;
-   ssize_t n;
+   SSize_t n;
    if (array && SvTYPE(array) == SVt_PVAV)
       av= (AV*) array;
    else if (array && SvROK(array) && SvTYPE(SvRV(array)) == SVt_PVAV)
@@ -151,7 +157,7 @@ static SV** unwrap_array(SV *array, ssize_t *len_out) {
          vec= (SV**) 8;
       else {
          /* in case of a tied array, extract the elements into a temporary buffer */
-         ssize_t i;
+         SSize_t i;
          Newx(vec, n, SV*);
          SAVEFREEPV(vec);
          for (i= 0; i < n; i++) {
@@ -283,7 +289,7 @@ _init_socketalarm(self, sock_sv, eventmask_sv, actions_sv)
       struct stat statbuf;
       struct socketalarm *sa;
       SV **action_list= NULL;
-      size_t n_actions= 0;
+      SSize_t n_actions= 0;
    PPCODE:
       if (!sv_isobject(self))
          croak("Not an object");
@@ -375,7 +381,7 @@ stringify(alarm)
       for (i= 0; i < alarm->action_count; i++) {
          char buf[256];
          snprint_action(buf, sizeof(buf), alarm->actions+i);
-         sv_catpvf(out, "%4d: %s\n", i, buf);
+         sv_catpvf(out, "%4d: %s\n", (int)i, buf);
       }
       SvREFCNT_inc(out);
       RETVAL= out;
