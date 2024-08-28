@@ -457,13 +457,16 @@ _poll(fd, events, timeout)
    SV *events;
    int timeout;
    INIT:
+      int ret;
       struct pollfd pollbuf;
    PPCODE:
       pollbuf.fd= fd;
       pollbuf.events= SvIV(events);
+      pollbuf.revents= 0;
+      ret= poll(&pollbuf, 1, timeout);
       EXTEND(SP, 2);
-      PUSHs(sv_2mortal(newSViv(poll(&pollbuf, 1, timeout))));
-      PUSHs(sv_2mortal(newSViv(pollbuf.revents)));
+      PUSHs(sv_2mortal(newSViv(ret)));
+      PUSHs(sv_2mortal(newSViv(ret < 0? errno : ret > 0? pollbuf.revents : 0)));
 
 #-----------------------------------------------------------------------------
 #  Constants

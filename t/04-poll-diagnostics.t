@@ -1,8 +1,9 @@
 use IO::SocketAlarm;
+my $have_rdhup;
 BEGIN {
    *$_= IO::SocketAlarm::Util->can($_)
       for qw( _poll POLLIN POLLPRI POLLOUT POLLERR POLLHUP POLLNVAL );
-   our $have_rdhup= !!IO::SocketAlarm::Util->can('POLLRDHUP');
+   $have_rdhup= !!IO::SocketAlarm::Util->can('POLLRDHUP');
    *POLLRDHUP= IO::SocketAlarm::Util->can('POLLRDHUP') || sub {};
 }
 use Test2::V0;
@@ -16,12 +17,19 @@ sub extract_poll_flags {
 
 socket my $s, AF_INET, SOCK_STREAM, 0
    or die "socket: $!";
+setsockopt($s, IPPROTO_TCP, TCP_NODELAY, 1);
+
 sub poll_sock {
    my ($ret, $revents)= _poll(fileno $_[0], $_[1], 0);
+   if ($ret < 1) {
+      note "poll: ret=$ret".($ret < 0? ", errno = $!" : "");
+   }
    $ret == 1? [ extract_poll_flags($revents) ] : undef
 }
 
-is( poll_sock($s, 0), [ POLLHUP ], 'initial state gives POLLHUP' );
+todo "Linux does, FreeBSD does not" => sub {
+   is( poll_sock($s, 0), [ POLLHUP ], 'initial state gives POLLHUP' );
+};
 
 listen $s, 10
    or die "listen: $!";
@@ -29,6 +37,8 @@ is( poll_sock($s, 0), undef,       'listening socket does not POLLHUP' );
 
 socket my $client, AF_INET, SOCK_STREAM, 0
    or die "socket: $!";
+setsockopt($client, IPPROTO_TCP, TCP_NODELAY, 1);
+
 $s->blocking(0);
 $client->blocking(0);
 connect($client, getsockname($s)) or $!{EINPROGRESS} or die "connect: $!";
