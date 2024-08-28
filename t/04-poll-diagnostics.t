@@ -9,6 +9,7 @@ BEGIN {
 use Test2::V0;
 use POSIX 'EPIPE';
 use Socket ':all';
+use IO::Socket;
 
 sub extract_poll_flags {
    map +($_[0] & $_? ($_):()),

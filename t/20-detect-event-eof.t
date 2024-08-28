@@ -4,6 +4,7 @@ use warnings;
 use IO::SocketAlarm 'socketalarm';
 use Socket ":all";
 use Time::HiRes 'sleep';
+use IO::Socket;
 
 sub tcp_socketpair;
 sub collect_alarms {

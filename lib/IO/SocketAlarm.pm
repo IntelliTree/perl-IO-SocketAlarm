@@ -11,7 +11,7 @@ require XSLoader;
 XSLoader::load('IO::SocketAlarm', $IO::SocketAlarm::VERSION);
 
 # All exports are part of the Util sub-package.
-package IO::SocketAlarm::Util {
+{package IO::SocketAlarm::Util;
    our @EXPORT_OK= qw( socketalarm get_fd_table_str is_socket );
    use Exporter 'import';
    # Declared in XS
