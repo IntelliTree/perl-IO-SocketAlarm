@@ -1,7 +1,9 @@
 use IO::SocketAlarm;
 BEGIN {
    *$_= IO::SocketAlarm::Util->can($_)
-      for qw( _poll POLLIN POLLPRI POLLOUT POLLRDHUP POLLERR POLLHUP POLLNVAL );
+      for qw( _poll POLLIN POLLPRI POLLOUT POLLERR POLLHUP POLLNVAL );
+   our $have_rdhup= !!IO::SocketAlarm::Util->can('POLLRDHUP');
+   *POLLRDHUP= IO::SocketAlarm::Util->can('POLLRDHUP') || sub {};
 }
 use Test2::V0;
 use POSIX 'EPIPE';
@@ -34,7 +36,7 @@ connect($client, getsockname($s)) or $!{EINPROGRESS} or die "connect: $!";
 accept my $server, $s or $!{EAGAIN} or $!{EWOULDBLOCK} or die "accept: $!";
 $server->blocking(0);
 
-my $allbits= POLLIN|POLLPRI|POLLOUT|POLLRDHUP;
+my $allbits= POLLIN|POLLPRI|POLLOUT|($have_rdhup? POLLRDHUP : 0);
 is( poll_sock($server, $allbits), [POLLOUT], 'new connection can write' );
 
 $client->syswrite("Test");
@@ -54,10 +56,12 @@ is( poll_sock($server, $allbits), [POLLIN,POLLOUT],
 #is( poll_sock($server, $allbits), [POLLIN,POLLOUT],
 #	'seems wrong, but no hup or error on server when client SHUT_RD' );
 
-shutdown($client, 1);
-is( poll_sock($server, $allbits), [POLLIN,POLLOUT,POLLRDHUP], 'POLLRDHUP when client SHUT_RDWR' );
+if ($have_rdhup) {
+   shutdown($client, 1);
+   is( poll_sock($server, $allbits), [POLLIN,POLLOUT,POLLRDHUP], 'POLLRDHUP when client SHUT_RDWR' );
 
-close($client);
-is( poll_sock($server, $allbits), [POLLIN,POLLOUT,POLLRDHUP], 'POLLRDHUP when client closes connection' );
+   close($client);
+   is( poll_sock($server, $allbits), [POLLIN,POLLOUT,POLLRDHUP], 'POLLRDHUP when client closes connection' );
+}
 
 done_testing;
