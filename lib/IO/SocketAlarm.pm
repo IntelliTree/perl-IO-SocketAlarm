@@ -85,6 +85,14 @@ doesn't even work because of mysql_auto_reconnect, and besides which, mysql serv
 notice that clients are gone until the current query ends.  Stopping a long-running mysql query
 can (seemingly) only be accomplished by running SQL on the server.
 
+B<Fifth caveat:> If you throw an exception in response to the signal and it occurs while an
+object destructor is running, the exception doesn't interrupt the main program flow.  This is
+a general problem with Perl's exceptions during destructors.  This is unlikely to impact you
+(if a destructor was running, then presumably the program wasn't stuck waiting on a long
+blocking process... unless it creates objects in a loop during that process) but if it does,
+you can work around it by writing a smarter signal handler that changes program state to
+indicate it's time to stop, rather than relying on Perl exceptions to bubble all the way up.
+
 =head1 EXPORTS
 
 This module exports everything from L<IO::SocketAlarm::Util>.  Of particular note:
