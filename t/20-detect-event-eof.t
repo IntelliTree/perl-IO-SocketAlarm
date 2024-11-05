@@ -59,7 +59,6 @@ sub tcp_socketpair {
    unless ($tcp_listen) {
       socket $tcp_listen, AF_INET, SOCK_STREAM, 0
          or die "socket: $!";
-      $tcp_listen->blocking(0);
       listen $tcp_listen, 10
          or die "listen: $!";
    }
@@ -70,6 +69,7 @@ sub tcp_socketpair {
       or $!{EINPROGRESS} or die "connect: $!";
    accept my $ss, $tcp_listen
       or die "accept: $!";
+   $ss->blocking(0);
    setsockopt($sc, IPPROTO_TCP, TCP_NODELAY, 1);
    setsockopt($ss, IPPROTO_TCP, TCP_NODELAY, 1);
    return ($sc, $ss);
